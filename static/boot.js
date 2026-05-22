@@ -1588,7 +1588,10 @@ function applyBotName(){
       if(!applied) $('modelSelect').value=stateToApply.model;
       // If the value didn't take (model not in list), clear the bad pref only
       // for persisted browser preferences. Active sessions remain authoritative.
-      if(!applied&&!sessionModelState&&$('modelSelect').value!==stateToApply.model){
+      if(!applied&&sessionModelState&&typeof _ensureModelOptionInDropdown==='function'){
+        _ensureModelOptionInDropdown(sessionModelState.model,$('modelSelect'),sessionModelState.model_provider||null);
+      }
+      else if(!applied&&!sessionModelState&&$('modelSelect').value!==stateToApply.model){
         if(typeof _clearPersistedModelState==='function') _clearPersistedModelState();
         else localStorage.removeItem('hermes-webui-model');
       }
