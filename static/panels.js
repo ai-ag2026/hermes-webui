@@ -182,6 +182,18 @@ function _consumeSettingsTargetPanel(fallback = 'chat') {
   return target;
 }
 
+function _resyncChatSidebarAfterPanelSwitch() {
+  if (_currentPanel !== 'chat') return;
+  if (typeof renderSessionListFromCache !== 'function') return;
+  const run = () => {
+    if (_currentPanel !== 'chat') return;
+    if (typeof _renamingSid !== 'undefined' && _renamingSid) return;
+    renderSessionListFromCache();
+  };
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run);
+  else run();
+}
+
 async function switchPanel(name, opts = {}) {
   const nextPanel = name || 'chat';
   const prevPanel = _currentPanel;
@@ -251,6 +263,7 @@ async function switchPanel(name, opts = {}) {
     if (sidebar) sidebar.classList.add('mobile-open');
     if (overlay) overlay.classList.add('visible');
   }
+  _resyncChatSidebarAfterPanelSwitch();
   syncAppTitlebar();
   return true;
 }
