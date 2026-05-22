@@ -188,6 +188,12 @@ function _resyncChatSidebarAfterPanelSwitch() {
   const run = () => {
     if (_currentPanel !== 'chat') return;
     if (typeof _renamingSid !== 'undefined' && _renamingSid) return;
+    // If the user opens the per-conversation action menu immediately after
+    // returning to Chat, do not let the deferred sidebar resync tear it down.
+    // renderSessionListFromCache() intentionally closes that menu before it
+    // rebuilds rows, which is correct for normal list refreshes but hostile to
+    // this one-shot panel-transition repair.
+    if (typeof _sessionActionMenu !== 'undefined' && _sessionActionMenu) return;
     renderSessionListFromCache();
   };
   if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run);

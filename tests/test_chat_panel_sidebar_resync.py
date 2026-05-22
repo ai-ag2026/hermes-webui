@@ -68,4 +68,6 @@ def test_chat_sidebar_resync_helper_is_guarded_and_bounded_to_one_animation_fram
     assert "requestAnimationFrame" in helper
     assert "setInterval" not in helper
     assert "setTimeout" not in helper
+    assert "typeof _sessionActionMenu !== 'undefined' && _sessionActionMenu" in helper
+    assert helper.index("typeof _sessionActionMenu") < helper.index("renderSessionListFromCache();")
     assert "renderSessionListFromCache();" in helper
