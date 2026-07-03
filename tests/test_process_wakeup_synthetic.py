@@ -166,6 +166,46 @@ def test_merge_display_leaves_webui_user_turn_unmarked():
     assert "_source" not in merged[0]
 
 
+def test_merge_display_backfills_assistant_after_recovered_current_user():
+    """A context-only final answer must not be spliced before the recovered user.
+
+    Regression for false `No response from provider` rows: a stale error path can
+    persist a recovered pending user after the real assistant answer was already
+    produced. Later state/context reconciliation may see that final assistant as
+    a context-only gap, but the matching user row exists only in the visible
+    display transcript. Backfilling the assistant before that recovered user
+    makes the transcript look like: assistant → user → partial/error.
+    """
+    prompt = "Plan and execute the audit workflow"
+    merged = _merge_display_messages_after_agent_result(
+        [
+            {"role": "assistant", "content": "previous answer"},
+            {"role": "user", "content": prompt, "_recovered": True, "timestamp": 100},
+            {"role": "assistant", "content": "partial", "_partial": True, "timestamp": 101},
+            {"role": "assistant", "content": "**No response from provider:** nope", "_error": True, "timestamp": 101},
+        ],
+        [
+            {"role": "assistant", "content": "previous answer"},
+            {"role": "assistant", "content": "final answer", "finish_reason": "stop"},
+        ],
+        [
+            {"role": "assistant", "content": "previous answer"},
+            {"role": "assistant", "content": "final answer", "finish_reason": "stop"},
+        ],
+        prompt,
+    )
+
+    assert [m.get("content") for m in merged] == [
+        "previous answer",
+        prompt,
+        "final answer",
+        "partial",
+        "**No response from provider:** nope",
+    ]
+    assert merged[1].get("_recovered") is True
+    assert merged[2].get("finish_reason") == "stop"
+
+
 def test_materialize_pending_user_turn_before_error_stamps_process_wakeup_source():
     s = Session(
         session_id="test-session-8",

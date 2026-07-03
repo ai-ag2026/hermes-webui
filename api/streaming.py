@@ -5069,6 +5069,7 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
             _cursor = 0
             for _display_idx, _dmsg in enumerate(previous_display):
                 _dkey = _display_keys[_display_idx]
+                _defer_context_gap_after_display = []
                 if _dkey is not None:
                     _j = _cursor
                     while _j < len(context_keys) and context_keys[_j] != _dkey:
@@ -5099,7 +5100,14 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
                             _ckey = context_keys[_k]
                             _cmsg = previous_context[_k]
                             if _ckey is not None and _ckey not in _context_inserted and _ckey not in _display_id_set and not _is_context_compression_marker(_cmsg):
-                                _backfilled.append(copy.deepcopy(_cmsg))
+                                if (
+                                    _looks_like_current_user_turn(_dmsg, msg_text)
+                                    and isinstance(_cmsg, dict)
+                                    and _cmsg.get('role') in ('assistant', 'tool')
+                                ):
+                                    _defer_context_gap_after_display.append(copy.deepcopy(_cmsg))
+                                else:
+                                    _backfilled.append(copy.deepcopy(_cmsg))
                                 _context_inserted.add(_ckey)
                         _cursor = len(context_keys)
                         _remaining_ck_counts.clear()
@@ -5107,6 +5115,8 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
                 # in order, even when an earlier (identical-content) turn or a
                 # backfilled context row shares its timestamp-less identity.
                 _backfilled.append(_dmsg)
+                if _defer_context_gap_after_display:
+                    _backfilled.extend(_defer_context_gap_after_display)
             while _cursor < len(context_keys):
                 _ckey = context_keys[_cursor]
                 _cmsg = previous_context[_cursor]
