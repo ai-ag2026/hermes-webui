@@ -5685,6 +5685,18 @@ def _persisted_final_assistant_messages(
         context = list(context_messages or [])
         if not context:
             context = list(visible)
+        elif _messages_have_final_assistant_for_current_turn(
+            visible,
+            msg_text,
+            previous_display=previous_display,
+            min_user_timestamp=min_user_timestamp,
+        ) and not _messages_have_final_assistant_for_current_turn(
+            context,
+            msg_text,
+            previous_display=previous_display,
+            min_user_timestamp=min_user_timestamp,
+        ):
+            context = list(visible)
         return {
             'messages': visible,
             'context_messages': context,
@@ -6132,10 +6144,10 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
             existing_text = " ".join(str(existing.get('content') or '').split())
             if existing_text == normalized_pending:
                 return False
-    recovered_ts = int(time.time())
+    recovered_ts = float(time.time())
     pending_started_at = getattr(session, 'pending_started_at', None)
     if isinstance(pending_started_at, (int, float)) and pending_started_at > 0:
-        recovered_ts = int(pending_started_at)
+        recovered_ts = float(pending_started_at)
     recovered = {
         'role': 'user',
         'content': pending_text,
@@ -10697,9 +10709,9 @@ def cancel_stream(stream_id: str) -> bool:
                                 if _pending_user == _last_content or _pending_user in _last_content:
                                     _already_persisted = True
                         if not _already_persisted:
-                            _recovered_ts = int(time.time())
+                            _recovered_ts = float(time.time())
                             if isinstance(_pending_started, (int, float)) and _pending_started > 0:
-                                _recovered_ts = int(_pending_started)
+                                _recovered_ts = float(_pending_started)
                             _user_turn: dict = {
                                 'role': 'user',
                                 'content': _pending_user,
