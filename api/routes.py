@@ -2209,7 +2209,12 @@ def _build_session_list_cache_payload(
     show_cron_sessions = bool(show_cron_sessions)
     show_webhook_sessions = bool(show_webhook_sessions)
     webui_sessions = [_normalize_sidebar_source_flags(s) for s in webui_sessions]
-    if show_cli_sessions:
+    # A WebUI-only sidebar request must not pay the CLI/agent projection cost and
+    # then filter it away. On large state.db / Claude-Code stores that projection
+    # can exceed the browser timeout and block later lightweight WebUI refreshes
+    # behind the same cache rebuild path.
+    load_cli_sessions = show_cli_sessions and sidebar_source != "webui"
+    if load_cli_sessions:
         diag_stage("get_cli_sessions")
         if _callable_accepts_kwarg(get_cli_sessions, "include_claude_code"):
             cli = get_cli_sessions(
