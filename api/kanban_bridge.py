@@ -127,6 +127,49 @@ def _task_dict(task):
     return data
 
 
+def _blocker_details(conn, tasks):
+    """Map task_id -> {human_summary, human_action, reason, block_kind} for
+    currently-blocked tasks, read from the latest 'blocked' event payload.
+
+    Powers the WebUI cockpit's blocker cards (2026-07-11 layman contract): the
+    worker-supplied plain-language fields live in the event payload, not on the
+    task row. Best-effort; a task with no readable payload simply gets no card
+    detail and the cockpit falls back to the title. Only blocked tasks are
+    queried so a large done/archived history costs nothing here.
+    """
+    blocked_ids = [t.id for t in tasks if getattr(t, "status", None) == "blocked"]
+    if not blocked_ids:
+        return {}
+    out = {}
+    try:
+        placeholders = ",".join("?" for _ in blocked_ids)
+        rows = conn.execute(
+            "SELECT task_id, payload, MAX(id) AS mid FROM task_events "
+            "WHERE kind = 'blocked' AND task_id IN (" + placeholders + ") "
+            "GROUP BY task_id",
+            blocked_ids,
+        ).fetchall()
+    except Exception:
+        return {}
+    for row in rows:
+        payload = {}
+        raw = row["payload"] if "payload" in row.keys() else None
+        if raw:
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                payload = {}
+        detail = {
+            "human_summary": (payload.get("human_summary") or "").strip() or None,
+            "human_action": (payload.get("human_action") or "").strip() or None,
+            "reason": (payload.get("reason") or "").strip() or None,
+            "block_kind": payload.get("kind"),
+        }
+        if any(detail.values()):
+            out[row["task_id"]] = detail
+    return out
+
+
 def _latest_event_id(conn) -> int:
     """Return the highest event id in task_events, falling back to 0 when the table is empty."""
     try:
@@ -222,11 +265,18 @@ def _board_payload(parsed):
         )
         link_counts = _task_link_counts(conn, tasks)
         comment_counts = _comment_counts(conn)
+        blocker_details = _blocker_details(conn, tasks)
 
         def row(task):
             data = _task_dict(task)
             data["link_counts"] = link_counts.get(task.id, {"parents": 0, "children": 0})
             data["comment_count"] = comment_counts.get(task.id, 0)
+            detail = blocker_details.get(task.id)
+            if detail:
+                # Layman-facing block context (human_summary/human_action/reason
+                # from the latest 'blocked' event) so the WebUI cockpit can lead
+                # with a plain-language card instead of an extra per-task fetch.
+                data["block_detail"] = detail
             return data
 
         columns = [
@@ -738,21 +788,58 @@ def _task_action_payload(task_id: str, body: dict, action: str, *, board=None):
     if not task_id:
         raise ValueError("task_id is required")
     with _conn(board=board) as conn:
-        if not kb.get_task(conn, task_id):
+        current = kb.get_task(conn, task_id)
+        if not current:
             raise LookupError("task not found")
         if action == "block":
             ok = kb.block_task(conn, task_id, reason=body.get("reason") or body.get("block_reason"))
         elif action == "unblock":
-            if hasattr(kb, "unblock_task"):
-                ok = kb.unblock_task(conn, task_id)
-            else:
-                _patch_task(conn, task_id, {"status": "ready"})
-                ok = True
+            note = str(body.get("reason") or "").strip()
+            ok = _unblock_gate_aware(conn, task_id, current, note)
         else:
             raise ValueError(f"invalid action: {action}")
         if not ok:
             raise RuntimeError(f"{action} refused")
         return {"task": _task_dict(kb.get_task(conn, task_id)), "read_only": False}
+
+
+def _unblock_gate_aware(conn, task_id: str, task, note: str = "") -> bool:
+    """Unblock a task from the WebUI, transparently clearing a Human-Gate.
+
+    The authenticated WebUI operator IS the human the gate exists for, so a
+    human_gate=1 card is released by minting a one-time token and redeeming it
+    in the same step (parity with the Telegram gate button; the plaintext token
+    never leaves this function). Ungated cards take the plain unblock path.
+    Every release is recorded as a comment for the board audit trail.
+    """
+    kb = _kb()
+    if not hasattr(kb, "unblock_task"):
+        _patch_task(conn, task_id, {"status": "ready"})
+        return True
+    gated = bool(getattr(task, "human_gate", 0))
+    if gated:
+        token = kb.issue_gate_token(conn, task_id, action="unblock")
+        if not token:
+            # Not actually gated/blocked anymore, or token mint refused — fall
+            # through to the plain path so a race doesn't hard-fail the click.
+            token = None
+        try:
+            kb.add_comment(
+                conn, task_id, "webui",
+                "GATE-FREIGABE via WebUI-Cockpit (Token einmalig erzeugt und "
+                "sofort eingelöst durch den eingeloggten Operator)"
+                + (f": {note}" if note else ""),
+            )
+        except Exception:
+            pass
+        if token:
+            return bool(kb.unblock_task(conn, task_id, actor="webui", reason=note or None, token=token))
+    elif note:
+        try:
+            kb.add_comment(conn, task_id, "webui", f"UNBLOCK via WebUI-Cockpit: {note}")
+        except Exception:
+            pass
+    return bool(kb.unblock_task(conn, task_id, actor="webui", reason=note or None))
 
 
 # ---------------------------------------------------------------------------
