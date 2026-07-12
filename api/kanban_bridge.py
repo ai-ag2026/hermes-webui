@@ -25,6 +25,10 @@ BOARD_COLUMNS = ["triage", "todo", "ready", "running", "blocked", "done"]
 _TASK_PREFIX = "/api/kanban/tasks/"
 
 
+class KanbanGoneError(RuntimeError):
+    """Requested approval existed but is expired, consumed, or cancelled."""
+
+
 def _kb():
     """Lazily import hermes_cli.kanban_db to avoid circular imports at module load."""
     from hermes_cli import kanban_db as kb
@@ -127,30 +131,48 @@ def _task_dict(task):
     return data
 
 
-def _blocker_details(conn, tasks):
-    """Map task_id -> {human_summary, human_action, reason, block_kind} for
-    currently-blocked tasks, read from the latest 'blocked' event payload.
+def _safe_exact_action_summary(_value) -> str:
+    """Return the only summary permitted across the opaque approval boundary.
 
-    Powers the WebUI cockpit's blocker cards (2026-07-11 layman contract): the
-    worker-supplied plain-language fields live in the event payload, not on the
-    task row. Best-effort; a task with no readable payload simply gets no card
-    detail and the cockpit falls back to the title. Only blocked tasks are
-    queried so a large done/archived history costs nothing here.
+    Exact-action rows are normally redacted by Core before persistence, but the
+    WebUI must not trust arbitrary historical/event prose or redactor coverage.
+    The detailed command stays exclusively in the worker-side approval context.
     """
-    blocked_ids = [t.id for t in tasks if getattr(t, "status", None) == "blocked"]
-    if not blocked_ids:
+    return "An exact terminal action is awaiting approval."
+
+
+def _blocker_details(conn, tasks):
+    """Project durable human attention independently of the current column."""
+    task_ids = [t.id for t in tasks]
+    if not task_ids:
         return {}
+    kb = _kb()
     out = {}
     try:
-        placeholders = ",".join("?" for _ in blocked_ids)
+        placeholders = ",".join("?" for _ in task_ids)
         rows = conn.execute(
-            "SELECT task_id, payload, MAX(id) AS mid FROM task_events "
-            "WHERE kind = 'blocked' AND task_id IN (" + placeholders + ") "
-            "GROUP BY task_id",
-            blocked_ids,
+            "SELECT id, task_id, kind, payload, created_at FROM task_events "
+            "WHERE task_id IN (" + placeholders + ") ORDER BY id ASC",
+            task_ids,
         ).fetchall()
     except Exception:
-        return {}
+        rows = []
+
+    pending_by_task = {}
+    if hasattr(kb, "get_pending_action"):
+        for task_id in task_ids:
+            try:
+                action = kb.get_pending_action(conn, task_id)
+            except Exception:
+                action = None
+            if action is not None:
+                pending_by_task[task_id] = action
+
+    resolution_kinds = {
+        "terminal_action_resolved", "terminal_action_completed",
+        "pending_action_resolved", "action_completed",
+        "terminal_approval_consumed", "terminal_approval_cancelled",
+    }
     for row in rows:
         payload = {}
         raw = row["payload"] if "payload" in row.keys() else None
@@ -159,15 +181,99 @@ def _blocker_details(conn, tasks):
                 payload = json.loads(raw)
             except Exception:
                 payload = {}
+        task_id = row["task_id"]
+        if row["kind"] in resolution_kinds:
+            if task_id not in pending_by_task:
+                out.pop(task_id, None)
+            continue
+        if row["kind"] == "unblocked":
+            if task_id not in pending_by_task:
+                out.pop(task_id, None)
+            continue
+        if row["kind"] in {"completed", "archived"}:
+            out.pop(task_id, None)
+            pending_by_task.pop(task_id, None)
+            continue
+        if row["kind"] not in {"blocked", "block_loop_detected"}:
+            continue
         detail = {
             "human_summary": (payload.get("human_summary") or "").strip() or None,
             "human_action": (payload.get("human_action") or "").strip() or None,
             "reason": (payload.get("reason") or "").strip() or None,
             "block_kind": payload.get("kind"),
+            "source_event_kind": row["kind"],
         }
-        if any(detail.values()):
-            out[row["task_id"]] = detail
+        if any((detail["human_summary"], detail["human_action"], detail["reason"])):
+            out[task_id] = detail
+
+    core_can_approve = all(callable(getattr(kb, name, None)) for name in (
+        "get_pending_action", "get_pending_action_by_id",
+        "approve_pending_action_and_unblock",
+    ))
+    for task_id in task_ids:
+        action = pending_by_task.get(task_id)
+        detail = out.get(task_id)
+        if action is None and detail is None:
+            continue
+        if detail is None:
+            detail = {
+                "human_summary": getattr(action, "summary", None),
+                "human_action": "Approve the exact terminal action or let it expire.",
+                "reason": "exact terminal action approval pending",
+                "block_kind": "needs_input",
+                "source_event_kind": "terminal_approval_pending",
+            }
+        sticky = action is not None
+        action_approved = bool(
+            sticky and getattr(action, "approved_at", None) is not None
+        )
+        if sticky:
+            # Exact-action transport is opaque. Ignore arbitrary blocker-event
+            # prose here: it may predate Core redaction or contain a raw command.
+            detail["human_summary"] = _safe_exact_action_summary(
+                getattr(action, "summary", None)
+            )
+            detail["reason"] = "exact terminal action approval pending"
+            detail["human_action"] = (
+                "Approved. Waiting for the resumed worker to execute the exact action."
+                if action_approved
+                else "Approve the exact terminal action or let it expire."
+            )
+        action_id = getattr(action, "id", None) if action is not None else None
+        detail.update({
+            "sticky": sticky,
+            "pending_action_id": action_id,
+            "pending_action_approved": action_approved,
+            "approval_unavailable_reason": (
+                "core" if sticky and not core_can_approve else None
+            ),
+            "pending_action_expires_at": (
+                getattr(action, "expires_at", None) if action is not None else None
+            ),
+            "actions": {
+                "plain_unblock": {"allowed": not sticky},
+                "approve_exact_action": {
+                    "available": bool(
+                        sticky and not action_approved
+                        and action_id is not None and core_can_approve
+                    ),
+                    "endpoint": (
+                        "approve-exact-action"
+                        if sticky and not action_approved
+                        and action_id is not None and core_can_approve else None
+                    ),
+                },
+            },
+        })
+        out[task_id] = detail
     return out
+
+
+def _sticky_block_detail(conn, task_id):
+    task = _kb().get_task(conn, task_id)
+    if not task:
+        raise LookupError("task not found")
+    return _blocker_details(conn, [task]).get(task_id)
 
 
 def _latest_event_id(conn) -> int:
@@ -421,6 +527,16 @@ def _patch_task(conn, task_id: str, body: dict):
     if not task:
         raise LookupError("task not found")
 
+    status = None
+    if "status" in body and body.get("status") not in (None, ""):
+        status = _validate_status(str(body.get("status")))
+        detail = _sticky_block_detail(conn, task_id)
+        if detail and detail.get("sticky") and status not in {"blocked", "archived"}:
+            raise RuntimeError(
+                "Cannot change card status while an exact terminal action is pending; "
+                "approve that exact action first"
+            )
+
     updates = {}
     if "title" in body:
         title = str(body.get("title") or "").strip()
@@ -453,9 +569,8 @@ def _patch_task(conn, task_id: str, body: dict):
         if not kb.assign_task(conn, task_id, body.get("assignee") or None):
             raise LookupError("task not found")
 
-    if "status" not in body or body.get("status") in (None, ""):
+    if status is None:
         return
-    status = _validate_status(body.get("status"))
     if status == "done":
         if not kb.complete_task(conn, task_id, result=body.get("result"), summary=body.get("summary")):
             raise LookupError("task not found")
@@ -565,8 +680,12 @@ def _task_detail_payload(task_id: str, *, board=None):
         task = kb.get_task(conn, task_id)
         if not task:
             return None
+        task_data = _task_dict(task)
+        detail = _blocker_details(conn, [task]).get(task_id)
+        if detail:
+            task_data["block_detail"] = detail
         return {
-            "task": _task_dict(task),
+            "task": task_data,
             "comments": [_obj_dict(c) for c in kb.list_comments(conn, task_id)],
             "events": [_obj_dict(e) for e in kb.list_events(conn, task_id)],
             "links": _links_for(conn, task_id),
@@ -794,6 +913,12 @@ def _task_action_payload(task_id: str, body: dict, action: str, *, board=None):
         if action == "block":
             ok = kb.block_task(conn, task_id, reason=body.get("reason") or body.get("block_reason"))
         elif action == "unblock":
+            detail = _sticky_block_detail(conn, task_id)
+            if detail and detail.get("sticky"):
+                raise RuntimeError(
+                    "Cannot unblock card while an exact terminal action is pending; "
+                    "approve that exact action first"
+                )
             note = str(body.get("reason") or "").strip()
             ok = _unblock_gate_aware(conn, task_id, current, note)
         else:
@@ -801,6 +926,62 @@ def _task_action_payload(task_id: str, body: dict, action: str, *, board=None):
         if not ok:
             raise RuntimeError(f"{action} refused")
         return {"task": _task_dict(kb.get_task(conn, task_id)), "read_only": False}
+
+
+def _approve_exact_action_payload(task_id: str, body: dict, *, board=None):
+    """Atomically approve one current action and unblock only its own card."""
+    kb = _kb()
+    task_id = str(task_id or "").strip()
+    raw_action_id = body.get("pending_action_id")
+    if not task_id or raw_action_id in (None, ""):
+        raise ValueError("task_id and pending_action_id are required")
+    try:
+        action_id = int(raw_action_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("pending_action_id must be an integer") from exc
+    required = (
+        "get_pending_action", "get_pending_action_by_id",
+        "approve_pending_action_and_unblock",
+    )
+    if not all(callable(getattr(kb, name, None)) for name in required):
+        raise RuntimeError("exact terminal action approval is unavailable in this Hermes core")
+    with _conn(board=board) as conn:
+        task = kb.get_task(conn, task_id)
+        if task is None:
+            raise LookupError("task not found")
+        current = kb.get_pending_action(conn, task_id)
+        if current is None:
+            historical = kb.get_pending_action_by_id(conn, task_id, action_id)
+            if historical is None:
+                raise LookupError("pending terminal action not found")
+            if (
+                historical.consumed_at is not None
+                or getattr(historical, "cancelled_at", None) is not None
+                or historical.expires_at <= int(time.time())
+            ):
+                raise KanbanGoneError("pending terminal action expired or was already resolved")
+            raise RuntimeError("no unresolved exact terminal action exists for this task")
+        if int(current.id) != action_id:
+            raise RuntimeError("pending terminal action changed; refresh before approving")
+        if getattr(current, "approved_at", None) is not None:
+            raise RuntimeError("pending terminal action was already approved")
+        result = kb.approve_pending_action_and_unblock(
+            conn, task_id, action_id, actor="webui",
+        )
+        if not result:
+            latest = kb.get_pending_action_by_id(conn, task_id, action_id)
+            if latest and (
+                latest.consumed_at is not None
+                or getattr(latest, "cancelled_at", None) is not None
+                or latest.expires_at <= int(time.time())
+            ):
+                raise KanbanGoneError("pending terminal action expired or was already resolved")
+            raise RuntimeError("exact terminal action approval conflicted with newer state")
+        return {
+            "ok": True,
+            "task": _task_dict(kb.get_task(conn, task_id)),
+            "read_only": False,
+        }
 
 
 def _unblock_gate_aware(conn, task_id: str, task, note: str = "") -> bool:
@@ -1333,6 +1514,9 @@ def handle_kanban_post(handler, parsed, body) -> bool | None:
             if path.startswith(_TASK_PREFIX) and path.endswith(suffix):
                 task_id = path[len(_TASK_PREFIX):-len(suffix)].strip("/")
                 return j(handler, _task_action_payload(task_id, body, action, board=board)) or True
+        if path.startswith(_TASK_PREFIX) and path.endswith("/approve-exact-action"):
+            task_id = path[len(_TASK_PREFIX):-len("/approve-exact-action")].strip("/")
+            return j(handler, _approve_exact_action_payload(task_id, body, board=board)) or True
         if path.startswith(_TASK_PREFIX) and path.endswith("/patch"):
             task_id = path[len(_TASK_PREFIX):-len("/patch")].strip("/")
             return j(handler, _patch_task_payload(task_id, body, board=board)) or True
@@ -1342,6 +1526,8 @@ def handle_kanban_post(handler, parsed, body) -> bool | None:
         return bad(handler, str(exc), status=404)
     except ValueError as exc:
         return bad(handler, str(exc))
+    except KanbanGoneError as exc:
+        return bad(handler, str(exc), status=410)
     except RuntimeError as exc:
         return bad(handler, str(exc), status=409)
     return False

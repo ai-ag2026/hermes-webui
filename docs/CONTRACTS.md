@@ -74,6 +74,30 @@ read the relevant RFC before editing. In the PR description, name the state laye
 or event/control surface affected and include a regression test or manual
 verification for the relevant invariant.
 
+### Kanban exact-action approval bridge
+
+Kanban board rows may carry an additive `block_detail` object even when their
+display status is projected as `triage`, `todo`, or `ready`. A sticky unresolved
+terminal action sets `actions.plain_unblock.allowed=false`; clients must not turn
+that card into Ready. `actions.approve_exact_action.available` advertises whether
+the installed Hermes core can consume an action-bound approval. When available,
+the WebUI calls `POST /api/kanban/tasks/{task_id}/approve-exact-action` with only
+the opaque `pending_action_id`. Hermes core remains responsible for atomically
+validating an immutable fingerprint over the board database, task, origin run,
+profile, canonical workspace, raw byte-preserving exact command, mutation kind and expiry;
+the resumed run must be the task's current active worker before consume. Plain
+`git push --force` is never recordable as an approvable action — destructive
+rewrites require an exact `--force-with-lease=<ref>:<old-sha>` command. Approval
+moves the card back to work and the resumed worker consumes the grant once.
+Unknown action/task identifiers return HTTP 404, expired or already-resolved
+actions return 410, and stale/replayed/conflicting state returns 409; every
+failure leaves both task status and blocker detail unchanged. For sticky exact
+actions the bridge exposes only a fixed generic summary/action, never arbitrary
+event prose or the persisted action summary. Ordinary human-gate
+tokens and ordinary card unblock remain separate controls. While offline, the
+client preserves the last verified board and its blocker details instead of
+replacing them with an error panel.
+
 Proposed RFCs are review guardrails, not implementation authorization. Do not
 implement RFC fragments unless the task or tracking issue explicitly asks for
 that slice.

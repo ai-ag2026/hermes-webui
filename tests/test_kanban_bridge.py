@@ -12,6 +12,7 @@ requiring the external package.
 from __future__ import annotations
 
 import importlib
+import json
 import sys
 import time
 import types
@@ -40,6 +41,20 @@ class FakeEvent:
     created_at: int
 
 
+@dataclass
+class FakePendingAction:
+    id: int
+    task_id: str
+    summary: str = "Publish exact reviewed ref"
+    expires_at: int = 2_000_000_000
+    approved_at: int | None = None
+    consumed_at: int | None = None
+    cancelled_at: int | None = None
+    command_hash: str = "hash-must-not-cross-bridge"
+    fingerprint: str = "fingerprint-must-not-cross-bridge"
+    arbitrary_secret: str = "secret-must-not-cross-bridge"
+
+
 class FakeRow(dict):
     def __getitem__(self, key):
         return dict.__getitem__(self, key)
@@ -64,6 +79,21 @@ class FakeConn:
             return SimpleNamespace(fetchall=lambda: [])
         if "FROM task_comments" in sql:
             return SimpleNamespace(fetchall=lambda: [])
+        if "FROM task_events" in sql and "task_id IN" in sql:
+            task_ids = set(params)
+            rows = [
+                FakeRow(
+                    id=e.id,
+                    task_id=e.task_id,
+                    kind=e.kind,
+                    payload=json.dumps(e.payload) if e.payload is not None else None,
+                    created_at=e.created_at,
+                )
+                for e in self.events
+                if e.task_id in task_ids
+            ]
+            rows.sort(key=lambda row: row["id"])
+            return SimpleNamespace(fetchall=lambda: rows)
         if "SELECT status, assignee, COUNT(*) AS n FROM tasks" in sql:
             rows = []
             grouped = {}
@@ -115,6 +145,7 @@ class FakeKanbanDB:
         self.links = []
         self.next_id = 3
         self.next_event_id = 8
+        self.pending_actions = {}
 
     def init_db(self, *, board=None):
         # board param accepted but ignored — the fake stores everything
@@ -209,12 +240,40 @@ class FakeKanbanDB:
         self._event(task_id, "archived", {})
         return True
 
-    def unblock_task(self, conn, task_id):
+    def unblock_task(self, conn, task_id, **_kwargs):
         task = self.get_task(conn, task_id)
         if not task:
             return False
         task.status = "ready"
         self._event(task_id, "unblocked", {})
+        return True
+
+    def get_pending_action(self, conn, task_id, now=None):
+        action = self.pending_actions.get(task_id)
+        effective_now = int(time.time()) if now is None else int(now)
+        if (
+            not action or action.consumed_at is not None
+            or action.cancelled_at is not None
+            or action.expires_at <= effective_now
+        ):
+            return None
+        return action
+
+    def get_pending_action_by_id(self, conn, task_id, action_id):
+        action = self.pending_actions.get(task_id)
+        if action and action.id == int(action_id):
+            return action
+        return None
+
+    def approve_pending_action_and_unblock(self, conn, task_id, action_id, actor="operator"):
+        action = self.get_pending_action(conn, task_id)
+        task = self.get_task(conn, task_id)
+        if not action or action.id != int(action_id) or not task or action.approved_at is not None:
+            return False
+        action.approved_at = int(time.time())
+        task.status = "ready"
+        self._event(task_id, "terminal_approval_granted", {"action_id": action.id, "actor": actor})
+        self._event(task_id, "unblocked", {"terminal_action_id": action.id, "actor": actor})
         return True
 
     def known_assignees(self, conn):
@@ -532,6 +591,161 @@ def test_kanban_only_mine_bulk_dispatch_and_block_unblock(monkeypatch):
     assert unblocked["task"]["status"] == "ready"
     assert dispatch["dry_run"] is True
     assert dispatch["max_spawn"] == 2
+
+
+def test_board_keeps_sticky_terminal_attention_across_status_projection_until_resolution(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    kb = bridge._kb()
+    task = FakeTask("t_approval", "Publish reviewed branch", "triage", "webui-test")
+    kb.tasks.append(task)
+    kb.pending_actions[task.id] = FakePendingAction(
+        1, task.id, summary="Publish with password=bridge-secret-value",
+    )
+    kb.events.extend([
+        FakeEvent(20, task.id, "run-1", "block_loop_detected", {
+            "reason": "token=bridge-secret-value", "kind": "needs_input",
+            "human_summary": "The reviewed branch is ready; password=bridge-secret-value",
+            "human_action": "Run git push https://user:bridge-secret-value@example.invalid/repo.",
+        }, 200),
+        FakeEvent(21, task.id, None, "status", {"status": "triage"}, 201),
+    ])
+
+    projected = bridge._board_payload(_parsed())
+    row = next(item for col in projected["columns"] for item in col["tasks"] if item["id"] == task.id)
+    assert row["block_detail"]["human_summary"]
+    assert row["block_detail"]["human_action"] == "Approve the exact terminal action or let it expire."
+    assert "bridge-secret-value" not in repr(row["block_detail"])
+    assert "git push" not in repr(row["block_detail"])
+    assert row["block_detail"]["sticky"] is True
+    assert row["block_detail"]["actions"]["plain_unblock"]["allowed"] is False
+    assert row["block_detail"]["pending_action_id"] == 1
+    serialized_detail = repr(row["block_detail"])
+    assert "hash-must-not-cross-bridge" not in serialized_detail
+    assert "fingerprint-must-not-cross-bridge" not in serialized_detail
+    assert "secret-must-not-cross-bridge" not in serialized_detail
+    assert row["block_detail"]["actions"]["approve_exact_action"]["available"] is True
+
+    kb.pending_actions[task.id].consumed_at = 202
+    kb.events.append(FakeEvent(22, task.id, None, "terminal_approval_consumed", {
+        "action_id": 1
+    }, 202))
+    resolved = bridge._board_payload(_parsed())
+    resolved_row = next(item for col in resolved["columns"] for item in col["tasks"] if item["id"] == task.id)
+    assert "block_detail" not in resolved_row
+
+
+def test_plain_ready_refuses_unresolved_sticky_terminal_attention_without_mutation(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    kb = bridge._kb()
+    task = FakeTask("t_sticky", "Publish reviewed branch", "triage", "webui-test")
+    kb.tasks.append(task)
+    kb.pending_actions[task.id] = FakePendingAction(1, task.id)
+    kb.events.append(FakeEvent(20, task.id, "run-1", "block_loop_detected", {
+        "reason": "terminal approval pending", "kind": "needs_input",
+        "human_summary": "Publication is waiting for approval.",
+        "human_action": "Approve the exact terminal command.",
+        "pending_action": {"id": "pa_1", "status": "pending", "action_hash": "sha256:abc"},
+    }, 200))
+
+    try:
+        bridge._patch_task_payload(task.id, {
+            "title": "changed despite conflict",
+            "assignee": "other-profile",
+            "status": "ready",
+        })
+    except RuntimeError as exc:
+        assert "exact terminal action" in str(exc).lower()
+    else:
+        raise AssertionError("plain Ready transition must conflict while exact terminal approval is pending")
+    assert task.status == "triage"
+    assert task.title == "Publish reviewed branch"
+    assert task.assignee == "webui-test"
+
+
+def test_exact_action_approval_endpoint_refuses_when_core_capability_is_unavailable(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    kb = bridge._kb()
+    task = FakeTask("t_sticky", "Publish reviewed branch", "triage", "webui-test")
+    kb.tasks.append(task)
+    kb.pending_actions[task.id] = FakePendingAction(1, task.id)
+    monkeypatch.setattr(kb, "approve_pending_action_and_unblock", None)
+    kb.events.append(FakeEvent(20, task.id, "run-1", "block_loop_detected", {
+        "kind": "needs_input",
+        "pending_action": {"id": "pa_1", "status": "pending", "action_hash": "sha256:abc"},
+    }, 200))
+
+    try:
+        bridge._approve_exact_action_payload(task.id, {"pending_action_id": 1})
+    except RuntimeError as exc:
+        assert "unavailable" in str(exc).lower()
+    else:
+        raise AssertionError("the WebUI must fail closed when core exact-action approval is unavailable")
+    assert task.status == "triage"
+
+
+def test_exact_action_approval_is_atomic_and_replay_conflicts(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    kb = bridge._kb()
+    task = FakeTask("t_atomic", "Publish reviewed branch", "triage", "webui-test")
+    kb.tasks.append(task)
+    kb.pending_actions[task.id] = FakePendingAction(7, task.id)
+    kb.events.append(FakeEvent(20, task.id, "run-1", "blocked", {
+        "kind": "needs_input", "reason": "approval required",
+    }, 200))
+
+    result = bridge._approve_exact_action_payload(task.id, {"pending_action_id": 7})
+    assert result["ok"] is True
+    assert task.status == "ready"
+    assert kb.pending_actions[task.id].approved_at is not None
+
+    try:
+        bridge._approve_exact_action_payload(task.id, {"pending_action_id": 7})
+    except RuntimeError as exc:
+        assert "already approved" in str(exc).lower()
+    else:
+        raise AssertionError("replayed approval must conflict")
+
+
+def test_exact_action_approval_distinguishes_missing_gone_and_stale(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    kb = bridge._kb()
+    task = FakeTask("t_states", "Publish reviewed branch", "blocked", "webui-test")
+    kb.tasks.append(task)
+
+    try:
+        bridge._approve_exact_action_payload(task.id, {"pending_action_id": 99})
+    except LookupError:
+        pass
+    else:
+        raise AssertionError("unknown action must be 404-class")
+
+    kb.pending_actions[task.id] = FakePendingAction(
+        8, task.id, expires_at=int(time.time()) - 1,
+    )
+    try:
+        bridge._approve_exact_action_payload(task.id, {"pending_action_id": 8})
+    except bridge.KanbanGoneError:
+        pass
+    else:
+        raise AssertionError("expired action must be 410-class")
+
+    kb.pending_actions[task.id] = FakePendingAction(
+        10, task.id, cancelled_at=int(time.time()),
+    )
+    try:
+        bridge._approve_exact_action_payload(task.id, {"pending_action_id": 10})
+    except bridge.KanbanGoneError:
+        pass
+    else:
+        raise AssertionError("cancelled action must be 410-class")
+
+    kb.pending_actions[task.id] = FakePendingAction(9, task.id)
+    try:
+        bridge._approve_exact_action_payload(task.id, {"pending_action_id": 8})
+    except RuntimeError as exc:
+        assert "changed" in str(exc).lower()
+    else:
+        raise AssertionError("stale action id must be 409-class")
 
 
 

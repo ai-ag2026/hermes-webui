@@ -101,6 +101,44 @@ def test_kanban_write_mvp_has_native_controls_and_api_calls():
     assert "kanban-comment-form" in PANELS
 
 
+def test_terminal_approval_controls_are_explicit_and_plain_ready_is_not_offered():
+    assert "function _kanbanAttentionHtml" in PANELS
+    assert "kanban_attention_summary" in PANELS
+    assert "kanban_attention_action" in PANELS
+    assert "kanban_unblock_card" in PANELS
+    assert "kanban_approve_exact_action" in PANELS
+    assert "kanban_exact_action_unavailable" in PANELS
+    assert "/approve-exact-action" in PANELS
+    assert "pending_action_id" in PANELS
+    assert "_kanbanCanMoveTask" in PANELS
+    assert "plain_unblock" in PANELS
+    assert "_kanbanExactApprovalInflight" in PANELS
+    assert "aria-busy" in PANELS
+    assert "_kanbanTaskLoadGeneration" in PANELS
+    assert "role=\"note\"" in PANELS
+    assert "aria-describedby" in PANELS
+    assert "approval && !approval.disabled" in PANELS
+    assert "else preview.querySelector('.kanban-back-btn')?.focus()" in PANELS
+    assert "kanban_exact_action_refresh_result" in PANELS
+
+    for key in (
+        "kanban_attention_summary", "kanban_attention_action", "kanban_unblock_card",
+        "kanban_approve_exact_action", "kanban_exact_action_unavailable",
+        "kanban_exact_action_refresh_result",
+    ):
+        assert key in I18N
+
+    for locale, body in _locale_blocks_with_body(I18N):
+        for key in (
+            "kanban_attention", "kanban_attention_summary", "kanban_attention_action",
+            "kanban_approve_exact_action", "kanban_exact_action_unavailable",
+            "kanban_terminal_action_still_pending", "kanban_exact_action_refresh_result",
+        ):
+            assert len(re.findall(rf"\b{re.escape(key)}\s*:", body)) == 1, (
+                f"{locale} must define {key} exactly once"
+            )
+
+
 def test_kanban_new_task_header_button_opens_modal():
     """Regression: the panel-head '+' button must open a real `.kanban-modal-overlay`
     create-task modal (matching the existing create-board modal pattern in the same
@@ -698,7 +736,8 @@ def test_kanban_ui_parity_polish_adds_card_metadata_quick_actions_and_swimlanes(
         "kanban-card-actions",
         "kanban-card-id",
         "kanban-card-assignee",
-        "draggable=\"true\"",
+        "draggable=\"${sticky ? 'false' : 'true'}\"",
+        "kanban-card-gated",
         "ondrop=\"dropKanbanTask",
         "onkeydown=\"if(event.key==='Enter'||event.key===' ')",
     ):
@@ -1317,3 +1356,18 @@ def test_kanban_unassigned_lane_in_sidebar_meta():
     meta_body = meta_match.group(1)
     # Must emit unassigned label when task.assignee is falsy.
     assert "t('kanban_unassigned')" in meta_body
+
+
+def test_kanban_offline_refresh_preserves_last_verified_board_and_blockers():
+    load_match = re.search(
+        r"async function loadKanban\(animate\)\{(.*?)\n\}",
+        PANELS,
+        re.DOTALL,
+    )
+    assert load_match, "loadKanban() not found"
+    body = load_match.group(1)
+    assert "animate && board && !_kanbanBoard" in body
+    assert "if (_kanbanBoard)" in body
+    assert "_kanbanRenderBoard()" in body
+    assert "showToast(`${t('kanban_unavailable')}" in body
+    assert "if (board) board.innerHTML = html" in body

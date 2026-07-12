@@ -14,6 +14,8 @@ let _kanbanBoardsList = null;
 let _kanbanBoardMenuOpen = false;
 let _kanbanIsDispatching = false;
 let _kanbanSuppressCardClickUntil = 0;
+const _kanbanExactApprovalInflight = new Set();
+let _kanbanTaskLoadGeneration = 0;
 // SSE event stream — replaces the 30s polling cadence with a long-lived
 // /api/kanban/events/stream connection. Falls back to polling when the
 // EventSource fails to connect (proxy that strips text/event-stream, etc).
@@ -2396,9 +2398,32 @@ function _kanbanCardStalenessClass(task){
 function _kanbanCardQuickActions(task){
   const id = esc(task.id || '');
   const status = task.status || '';
-  const complete = status !== 'done' && status !== 'archived' ? `<button type="button" class="kanban-card-action" onclick="quickKanbanCardAction(event,'${id}','done')">${esc(t('kanban_card_complete'))}</button>` : '';
+  const sticky = !!(task.block_detail && task.block_detail.sticky);
+  const complete = !sticky && status !== 'done' && status !== 'archived' ? `<button type="button" class="kanban-card-action" onclick="quickKanbanCardAction(event,'${id}','done')">${esc(t('kanban_card_complete'))}</button>` : '';
   const archive = status !== 'archived' ? `<button type="button" class="kanban-card-action danger" onclick="quickKanbanCardAction(event,'${id}','archived')">${esc(t('kanban_card_archive'))}</button>` : '';
   return `<div class="kanban-card-actions" onclick="event.stopPropagation()">${complete}${archive}</div>`;
+}
+
+function _kanbanCanMoveTask(task, status){
+  const detail = task && task.block_detail;
+  if (detail && detail.sticky) return status === 'blocked' || status === 'archived';
+  return true;
+}
+
+function _kanbanAttentionHtml(task, compact){
+  const detail = task && task.block_detail;
+  if (!detail) return '';
+  const summary = detail.human_summary || detail.reason || '';
+  const action = detail.human_action || '';
+  if (!summary && !action) return '';
+  const approve = detail.actions && detail.actions.approve_exact_action;
+  const unavailable = detail.approval_unavailable_reason === 'core';
+  const attentionId = `kanban-attention-${String(task.id || '').replace(/[^a-zA-Z0-9_-]/g, '-')}`;
+  return `<section id="${esc(attentionId)}" class="kanban-attention${compact ? ' compact' : ''}" role="note" aria-label="${esc(t('kanban_attention'))}">
+    ${summary ? `<div class="kanban-attention-summary"><strong>${esc(t('kanban_attention_summary'))}</strong> ${esc(summary)}</div>` : ''}
+    ${action ? `<div class="kanban-attention-action"><strong>${esc(t('kanban_attention_action'))}</strong> ${esc(action)}</div>` : ''}
+    ${unavailable ? `<div class="kanban-attention-unavailable">${esc(t('kanban_exact_action_unavailable'))}</div>` : ''}
+  </section>`;
 }
 
 async function quickKanbanCardAction(event, taskId, status){
@@ -2458,7 +2483,12 @@ async function dropKanbanTask(event, status){
   event.stopPropagation();
   clearKanbanDrop(event);
   const taskId = event.dataTransfer ? event.dataTransfer.getData('text/plain') : '';
-  if (taskId && status) await updateKanbanTask(taskId, {status}, {openDetail: false});
+  const task = ((_kanbanBoard && _kanbanBoard.columns) || []).flatMap(col => col.tasks || []).find(item => item.id === taskId);
+  if (taskId && status && !_kanbanCanMoveTask(task, status)) {
+    showToast(t('kanban_terminal_action_still_pending'), 5000, 'error');
+  } else if (taskId && status) {
+    await updateKanbanTask(taskId, {status}, {openDetail: false});
+  }
   _kanbanSuppressNextCardClick();
 }
 
@@ -2547,9 +2577,12 @@ function _kanbanCard(task, status){
   const stale = _kanbanCardStalenessClass(task);
   const body = _kanbanTaskBody(task);
   const assignee = task.assignee ? `<span class="kanban-card-assignee">@${esc(task.assignee)}</span>` : `<span class="kanban-card-unassigned">${esc(t('kanban_unassigned'))}</span>`;
-  return `<article class="kanban-card ${esc(stale)}" data-kanban-task-id="${esc(task.id)}" draggable="true" ondragstart="dragKanbanTask(event, '${esc(task.id)}')" ondragend="finishKanbanDrag(event)" onclick="return openKanbanCard(event, '${esc(task.id)}')" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();loadKanbanTask('${esc(task.id)}')}">
+  const sticky = !!(task.block_detail && task.block_detail.sticky);
+  const attentionId = `kanban-attention-${String(task.id || '').replace(/[^a-zA-Z0-9_-]/g, '-')}`;
+  return `<article class="kanban-card ${esc(stale)}${sticky ? ' kanban-card-gated' : ''}" data-kanban-task-id="${esc(task.id)}" draggable="${sticky ? 'false' : 'true'}" ${sticky ? `aria-describedby="${esc(attentionId)}"` : `ondragstart="dragKanbanTask(event, '${esc(task.id)}')" ondragend="finishKanbanDrag(event)"`} onclick="return openKanbanCard(event, '${esc(task.id)}')" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();loadKanbanTask('${esc(task.id)}')}">
     <div class="kanban-card-topline"><span class="kanban-card-id">${esc(task.id || '')}</span>${priority ? `<span class="kanban-badge priority">P${priority}</span>` : ''}${task.tenant ? `<span class="kanban-badge tenant">${esc(task.tenant)}</span>` : ''}</div>
     <div class="kanban-card-title">${esc(_kanbanTaskTitle(task))}</div>
+    ${_kanbanAttentionHtml(task, true)}
     ${body ? `<div class="kanban-card-body">${_kanbanRenderMarkdown(body)}</div>` : ''}
     <div class="kanban-card-meta">${assignee}${comments ? `<span class="kanban-card-metric">💬 ${comments}</span>` : ''}${linkTotal ? `<span class="kanban-card-metric">↔ ${linkTotal}</span>` : ''}${age ? `<span class="kanban-card-age">${esc(age)}</span>` : ''}</div>
     ${_kanbanCardQuickActions(task)}
@@ -2668,7 +2701,7 @@ async function loadKanban(animate){
   const board = $('kanbanBoard');
   const list = $('kanbanList');
   try {
-    if (animate && board) board.innerHTML = `<div style="padding:16px;color:var(--muted);font-size:13px">${esc(t('loading'))}</div>`;
+    if (animate && board && !_kanbanBoard) board.innerHTML = `<div style="padding:16px;color:var(--muted);font-size:13px">${esc(t('loading'))}</div>`;
     // Resolve the active board before board-scoped requests. If another CLI or
     // tab archived the previous board, /boards can fall back to default instead
     // of leaving config/board pinned to a ghost slug.
@@ -2713,8 +2746,15 @@ async function loadKanban(animate){
     _kanbanRenderBoard();
   } catch(e) {
     const html = _kanbanUnavailableHtml(e);
-    if (board) board.innerHTML = html;
-    if (list) list.innerHTML = html;
+    if (_kanbanBoard) {
+      // Keep the last verified board visible while offline. Replacing it with
+      // an error panel hides exact-action blockers at precisely the worst time.
+      _kanbanRenderBoard();
+      showToast(`${t('kanban_unavailable')}: ${e.message || e}`, 5000, 'error');
+    } else {
+      if (board) board.innerHTML = html;
+      if (list) list.innerHTML = html;
+    }
   }
 }
 
@@ -3726,9 +3766,17 @@ function _kanbanRenderTaskDetail(data){
   // bridge rejects PATCH status='running' with HTTP 400 to match the agent
   // dashboard plugin's contract. UI users want to claim/promote a ready task
   // via the dispatcher Nudge button, not flip it to running by hand.
-  const statusButtons = ['triage', 'todo', 'ready', 'blocked', 'done', 'archived'].map(status =>
+  const statusButtons = ['triage', 'todo', 'ready', 'blocked', 'done', 'archived'].filter(status => _kanbanCanMoveTask(task, status)).map(status =>
     `<button class="btn secondary" onclick="updateKanbanTask('${esc(task.id)}',{status:'${status}'})">${esc(_kanbanColumnLabel(status))}</button>`
-  ).join('') + `<button class="btn secondary" onclick="blockKanbanTask('${esc(task.id)}')">${esc(t('kanban_block'))}</button><button class="btn secondary" onclick="unblockKanbanTask('${esc(task.id)}')">${esc(t('kanban_unblock'))}</button>`;
+  ).join('') + `<button class="btn secondary" onclick="blockKanbanTask('${esc(task.id)}')">${esc(t('kanban_block'))}</button>`;
+  const detail = task.block_detail;
+  const plainUnblock = detail && detail.actions && detail.actions.plain_unblock;
+  const exactApproval = detail && detail.actions && detail.actions.approve_exact_action;
+  const unblockButton = (!detail || !detail.sticky || (plainUnblock && plainUnblock.allowed))
+    ? `<button class="btn secondary" onclick="unblockKanbanTask('${esc(task.id)}')">${esc(t('kanban_unblock_card'))}</button>` : '';
+  const approvalAttentionId = `kanban-attention-${String(task.id || '').replace(/[^a-zA-Z0-9_-]/g, '-')}`;
+  const approveButton = detail && detail.sticky
+    ? `<button class="btn primary" onclick="approveExactKanbanAction(event,'${esc(task.id)}','${esc(detail.pending_action_id || '')}')" aria-describedby="${esc(approvalAttentionId)}" title="${esc(exactApproval && exactApproval.available ? t('kanban_approve_exact_action') : t('kanban_exact_action_unavailable'))}" ${exactApproval && exactApproval.available ? '' : 'disabled aria-disabled="true"'}>${esc(t('kanban_approve_exact_action'))}</button>` : '';
   return `<div class="kanban-task-preview-header">
       <button class="btn secondary kanban-back-btn" onclick="closeKanbanTaskDetail()">${esc(t('kanban_back_to_board'))}</button>
       <div class="kanban-task-preview-title">${esc(title)}</div>
@@ -3736,7 +3784,8 @@ function _kanbanRenderTaskDetail(data){
     </div>
     <div class="kanban-task-preview-body">${_kanbanRenderMarkdown(body)}</div>
     ${meta.length ? `<div class="kanban-meta">${esc(meta.join(' · '))}</div>` : ''}
-    <div class="kanban-status-actions">${statusButtons}</div>
+    ${_kanbanAttentionHtml(task, false)}
+    <div class="kanban-status-actions">${statusButtons}${unblockButton}${approveButton}</div>
     <div class="kanban-detail-grid">
       ${_kanbanDetailSection('kanban-detail-comments', String(t('kanban_comments_count')).replace('{0}', comments.length), comments.map(_kanbanCommentHtml).join(''), 'kanban_no_comments')}
       ${_kanbanDetailSection('kanban-detail-events', String(t('kanban_events_count')).replace('{0}', events.length), events.map(_kanbanEventHtml).join(''), 'kanban_no_events')}
@@ -3750,11 +3799,51 @@ function _kanbanRenderTaskDetail(data){
     </div>`;
 }
 
+async function approveExactKanbanAction(event, taskId, pendingActionId){
+  if (!taskId || !pendingActionId) {
+    showToast(t('kanban_exact_action_unavailable'), 5000, 'error');
+    return;
+  }
+  const key = `${taskId}:${pendingActionId}`;
+  if (_kanbanExactApprovalInflight.has(key)) return;
+  _kanbanExactApprovalInflight.add(key);
+  const button = event && event.currentTarget;
+  if (button) {
+    button.disabled = true;
+    button.setAttribute('aria-disabled', 'true');
+    button.setAttribute('aria-busy', 'true');
+  }
+  try {
+    await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + '/approve-exact-action' + _kanbanBoardQuery(), {
+      method: 'POST',
+      body: JSON.stringify({pending_action_id: pendingActionId}),
+    });
+    await loadKanban(true);
+    await loadKanbanTask(taskId);
+  } catch(e) {
+    // Another tab may have won the one-shot CAS. Refresh authoritative state
+    // before reporting the conflict so stale local DOM cannot claim it is pending.
+    await loadKanban(true).catch(()=>{});
+    await loadKanbanTask(taskId).catch(()=>{});
+    showToast(t('kanban_exact_action_refresh_result') + ': ' + (e.message || e), 6000, 'error');
+  } finally {
+    _kanbanExactApprovalInflight.delete(key);
+    if (button && button.isConnected) {
+      button.disabled = false;
+      button.removeAttribute('aria-disabled');
+      button.removeAttribute('aria-busy');
+      button.focus();
+    }
+  }
+}
+
 async function loadKanbanTask(taskId){
   if (!taskId) return;
+  const generation = ++_kanbanTaskLoadGeneration;
   try {
     const data = await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + _kanbanBoardQuery());
     try { data.log = await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + '/log' + _kanbanBoardQuery({tail: 65536})); } catch(e) { data.log = {}; }
+    if (generation !== _kanbanTaskLoadGeneration) return;
     _kanbanCurrentTaskId = taskId;
     const task = data.task || {};
     const title = _kanbanTaskTitle(task);
@@ -3767,10 +3856,17 @@ async function loadKanbanTask(taskId){
     if (preview) {
       preview.style.display = '';
       preview.innerHTML = _kanbanRenderTaskDetail(data);
+      const approval = preview.querySelector('button[onclick^="approveExactKanbanAction"]');
+      if (approval && !approval.disabled) approval.focus();
+      else preview.querySelector('.kanban-back-btn')?.focus();
     }
     _closeMobileSidebarAfterPanelSelection();
     showToast(`${t('kanban_task')}: ${title}`);
-  } catch(e) { showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error'); }
+  } catch(e) {
+    if (generation === _kanbanTaskLoadGeneration) {
+      showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error');
+    }
+  }
 }
 
 // Phase 2: Single-source-of-truth render.

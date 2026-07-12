@@ -6788,6 +6788,11 @@ main.main.showing-insights > #mainInsights{display:flex;overflow-y:auto;}
 .kanban-task-preview-body{font-size:12px;color:var(--muted);line-height:1.45;margin-bottom:6px;}
 .kanban-status-actions{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 4px;}
 .kanban-status-actions .btn{font-size:11px;padding:4px 8px;}
+.kanban-attention{margin:10px 0;padding:10px;border:1px solid color-mix(in srgb,var(--warning,#E0B15D) 55%,var(--border));border-radius:8px;background:color-mix(in srgb,var(--warning,#E0B15D) 8%,var(--bg));color:var(--text);font-size:12px;line-height:1.45;overflow-wrap:anywhere;}
+.kanban-attention.compact{margin:8px 0 2px;padding:7px;font-size:11px;}
+.kanban-attention-summary+.kanban-attention-action{margin-top:5px;}
+.kanban-attention-unavailable{margin-top:7px;color:var(--muted);}
+.kanban-status-actions .btn:disabled{cursor:not-allowed;opacity:.55;}
 /* Generic styled buttons used throughout the Kanban panel. The Kanban PR
    stack standardised on `.btn` / `.btn.secondary` class names but never
    shipped the matching CSS, so without these rules buttons fall back to
