@@ -371,3 +371,57 @@ def test_unsaved_new_session_survives_churn_and_stays_startable(isolated_session
     # The chokepoint both failing routes go through.
     assert get_session(sid, metadata_only=True) is not None
     assert get_session(sid).session_id == sid
+
+
+def test_content_search_scan_does_not_evict_the_working_set(isolated_session_env):
+    """A content search must not push the user's open sessions out of the cache.
+
+    /api/sessions/search?content=1 walks EVERY session. Routing that through
+    get_session() inserted each one into the LRU and marked it recently-used, so
+    a single search over an install with more sessions than the cap flushed the
+    whole cache — the classic buffer-pool scan-pollution problem. The sessions
+    the user actually had open were the ones evicted.
+
+    get_session_for_scan() reads without promoting or inserting, so a scan is
+    transparent to the LRU.
+    """
+    from api import config as _cfg
+    from api.config import SESSIONS
+    from api.models import get_session, get_session_for_scan
+
+    _cfg.SESSIONS_MAX = 5
+
+    working = []
+    for i in range(4):
+        s = _make_persisted_session(900 + i)
+        get_session(s.session_id)          # the user opens it -> legitimately cached
+        working.append(s.session_id)
+
+    corpus = [_make_persisted_session(i).session_id for i in range(60)]
+
+    for sid in corpus:                     # what the content search does
+        assert get_session_for_scan(sid) is not None
+
+    for sid in working:
+        assert sid in SESSIONS, "a scan evicted the user's working set"
+    assert not any(sid in SESSIONS for sid in corpus), "the scan polluted the LRU"
+    assert len(SESSIONS) <= _cfg.SESSIONS_MAX
+
+
+def test_scan_accessor_reuses_resident_sessions_without_promoting(isolated_session_env):
+    """A scan hit must reuse the cached object but must not refresh its recency."""
+    from api import config as _cfg
+    from api.config import SESSIONS
+    from api.models import get_session, get_session_for_scan
+
+    _cfg.SESSIONS_MAX = 50
+    first = _make_persisted_session(801)
+    second = _make_persisted_session(802)
+    get_session(first.session_id)
+    get_session(second.session_id)         # second is now the most-recent entry
+
+    order_before = list(SESSIONS.keys())
+    scanned = get_session_for_scan(first.session_id)
+
+    assert scanned is SESSIONS[first.session_id], "scan should reuse the resident object"
+    assert list(SESSIONS.keys()) == order_before, "scan must not promote in the LRU"
