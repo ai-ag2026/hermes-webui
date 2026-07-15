@@ -3791,6 +3791,12 @@ function _kanbanRenderTaskDetail(data){
   const taskStatus = String(task.status || '').toLowerCase();
   const reopenButton = (taskStatus === 'done' || taskStatus === 'archived')
     ? `<button class="btn secondary" onclick="reopenKanbanTask(event,'${esc(task.id)}')" title="${esc(t('kanban_reopen_hint'))}">${esc(t('kanban_reopen'))}</button>` : '';
+  // An approved action whose worker died technically. Nothing resumes it on its
+  // own; before 2026-07-15 the only clickable way out was archiving, which
+  // cancels the approval the human already gave instead of honouring it.
+  const resume = detail && detail.actions && detail.actions.resume_approved_action_retry;
+  const resumeButton = resume && resume.available
+    ? `<button class="btn primary" onclick="resumeApprovedActionRetry(event,'${esc(task.id)}',${Number(resume.attention_id)},${Number(resume.attention_version)},${Number(resume.origin_run_id)})" title="${esc(t('kanban_resume_retry_hint'))}">${esc(t('kanban_resume_retry'))}</button>` : '';
   return `<div class="kanban-task-preview-header">
       <button class="btn secondary kanban-back-btn" onclick="closeKanbanTaskDetail()">${esc(t('kanban_back_to_board'))}</button>
       <div class="kanban-task-preview-title">${esc(title)}</div>
@@ -3799,7 +3805,7 @@ function _kanbanRenderTaskDetail(data){
     <div class="kanban-task-preview-body">${_kanbanRenderMarkdown(body)}</div>
     ${meta.length ? `<div class="kanban-meta">${esc(meta.join(' · '))}</div>` : ''}
     ${_kanbanAttentionHtml(task, false)}
-    <div class="kanban-status-actions">${statusButtons}${unblockButton}${approveButton}${rejectButton}${reopenButton}</div>
+    <div class="kanban-status-actions">${statusButtons}${unblockButton}${approveButton}${resumeButton}${rejectButton}${reopenButton}</div>
     <div class="kanban-detail-grid">
       ${_kanbanDetailSection('kanban-detail-comments', String(t('kanban_comments_count')).replace('{0}', comments.length), comments.map(_kanbanCommentHtml).join(''), 'kanban_no_comments')}
       ${_kanbanDetailSection('kanban-detail-events', String(t('kanban_events_count')).replace('{0}', events.length), events.map(_kanbanEventHtml).join(''), 'kanban_no_events')}
@@ -3902,6 +3908,44 @@ async function rejectExactKanbanAction(event, taskId, pendingActionId){
     if (button && button.isConnected) {
       button.disabled = false;
       button.removeAttribute('aria-disabled');
+      button.removeAttribute('aria-busy');
+    }
+  }
+}
+
+// The escape from a technical park. The CAS handles come from the server via
+// block_detail -- an operator cannot invent an attention version or a run id,
+// which is precisely why this Core seam sat unreachable with no caller.
+async function resumeApprovedActionRetry(event, taskId, attentionId, attentionVersion, originRunId){
+  if (!taskId || !attentionId || !originRunId) {
+    showToast(t('kanban_resume_retry_unavailable'), 5000, 'error');
+    return;
+  }
+  const key = `${taskId}:resume:${attentionId}`;
+  if (_kanbanExactApprovalInflight.has(key)) return;
+  _kanbanExactApprovalInflight.add(key);
+  const button = event && event.currentTarget;
+  if (button) { button.disabled = true; button.setAttribute('aria-busy', 'true'); }
+  try {
+    await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + '/resume-approved-action-retry' + _kanbanBoardQuery(), {
+      method: 'POST',
+      body: JSON.stringify({
+        attention_id: attentionId,
+        attention_version: attentionVersion,
+        origin_run_id: originRunId,
+      }),
+    });
+    await loadKanban(true);
+    await loadKanbanTask(taskId);
+    showToast(t('kanban_resume_retry_done'), 4000, 'success');
+  } catch(e) {
+    await loadKanban(true).catch(()=>{});
+    await loadKanbanTask(taskId).catch(()=>{});
+    showToast(t('kanban_exact_action_refresh_result') + ': ' + (e.message || e), 6000, 'error');
+  } finally {
+    _kanbanExactApprovalInflight.delete(key);
+    if (button && button.isConnected) {
+      button.disabled = false;
       button.removeAttribute('aria-busy');
     }
   }

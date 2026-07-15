@@ -168,6 +168,19 @@ def _blocker_details(conn, tasks):
             if action is not None:
                 pending_by_task[task_id] = action
 
+    # get_pending_action does not filter by attention type, so an approved
+    # action whose worker was killed on a runtime timeout looks identical here
+    # to one a worker is about to run. The Core parks the former by swapping the
+    # projection to capability/transient -- the ONLY signal that nothing is
+    # coming. Without reading it this view tells the operator "waiting for the
+    # resumed worker" forever, about a worker that will never exist.
+    attention_by_task = {}
+    if hasattr(kb, "get_current_attentions"):
+        try:
+            attention_by_task = kb.get_current_attentions(conn, task_ids) or {}
+        except Exception:
+            attention_by_task = {}
+
     resolution_kinds = {
         "terminal_action_resolved", "terminal_action_completed",
         "pending_action_resolved", "action_completed",
@@ -230,21 +243,44 @@ def _blocker_details(conn, tasks):
         action_approved = bool(
             sticky and getattr(action, "approved_at", None) is not None
         )
+        attention = attention_by_task.get(task_id)
+        attention_type = getattr(attention, "type", None)
+        # An approved action parked by a technical failure: the worker was
+        # killed mid-execution (e.g. enforce_max_runtime) and the Core swapped
+        # the exact projection for a technical one. Nothing will resume it on
+        # its own -- resume_approved_action_retry is the only way out.
+        technical_park = bool(
+            sticky and action_approved
+            and attention_type in ("capability", "transient")
+        )
         if sticky:
             # Exact-action transport is opaque. Ignore arbitrary blocker-event
             # prose here: it may predate Core redaction or contain a raw command.
             detail["human_summary"] = _safe_exact_action_summary(
                 getattr(action, "summary", None)
             )
-            detail["reason"] = "exact terminal action approval pending"
+            detail["reason"] = (
+                "approved exact action parked after a technical failure"
+                if technical_park else "exact terminal action approval pending"
+            )
             detail["human_action"] = (
+                "Approved, but the worker failed technically and was parked. "
+                "Nothing will resume on its own — retry it, or reject the action."
+                if technical_park else
                 "Approved. Waiting for the resumed worker to execute the exact action."
                 if action_approved
                 else "Approve the exact terminal action or let it expire."
             )
         action_id = getattr(action, "id", None) if action is not None else None
+        core_can_resume = callable(getattr(kb, "resume_approved_action_retry", None))
+        resume_available = bool(
+            technical_park and core_can_resume
+            and getattr(attention, "origin_run_id", None) is not None
+        )
         detail.update({
             "sticky": sticky,
+            "attention_type": attention_type,
+            "technical_park": technical_park,
             "pending_action_id": action_id,
             "pending_action_approved": action_approved,
             "approval_unavailable_reason": (
@@ -278,6 +314,15 @@ def _blocker_details(conn, tasks):
                         "reject-exact-action"
                         if sticky and action_id is not None and core_can_reject else None
                     ),
+                },
+                # The escape from a technical park. Carries the CAS handles the
+                # Core seam demands, because the operator cannot invent them.
+                "resume_approved_action_retry": {
+                    "available": resume_available,
+                    "endpoint": "resume-approved-action-retry" if resume_available else None,
+                    "attention_id": getattr(attention, "id", None) if resume_available else None,
+                    "attention_version": getattr(attention, "version", None) if resume_available else None,
+                    "origin_run_id": getattr(attention, "origin_run_id", None) if resume_available else None,
                 },
             },
         })
@@ -1073,6 +1118,55 @@ def _approve_exact_action_payload(task_id: str, body: dict, *, board=None):
         }
 
 
+def _resume_approved_action_retry_payload(task_id: str, body: dict, *, board=None):
+    """Retry an approved exact action that a technical failure parked.
+
+    When a worker exceeds max_runtime_seconds while executing an already
+    approved action, the Core kills it and parks the card: the action stays
+    `approved`, the projection becomes capability/transient. Nothing resumes it.
+    Until 2026-07-15 the UI showed "Approved. Waiting for the resumed worker"
+    forever and the only clickable way out was archiving, which cancels the
+    human's approval instead of honouring it.
+
+    The Core seam for this existed and was correct all along -- it just had no
+    caller anywhere, because it needs origin_run_id and no API ever emitted it.
+    """
+    kb = _kb()
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        raise ValueError("task_id is required")
+    if not callable(getattr(kb, "resume_approved_action_retry", None)):
+        raise RuntimeError("approved-action retry is unavailable in this Hermes core")
+    try:
+        attention_id = int(body.get("attention_id"))
+        attention_version = int(body.get("attention_version"))
+        origin_run_id = int(body.get("origin_run_id"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "attention_id, attention_version and origin_run_id are required integers"
+        ) from exc
+    with _conn(board=board) as conn:
+        if kb.get_task(conn, task_id) is None:
+            raise LookupError("task not found")
+        result = kb.resume_approved_action_retry(
+            conn, task_id=task_id, expected_attention_id=attention_id,
+            expected_attention_version=attention_version,
+            expected_origin_run_id=origin_run_id, actor="webui",
+        )
+        if not result:
+            status = getattr(result, "status", None)
+            if status == "not_found":
+                raise LookupError("parked approved action not found")
+            if status == "gone":
+                raise KanbanGoneError("the parked approved action is no longer available")
+            raise RuntimeError("retry refused: the card changed; refresh and retry")
+        return {
+            "ok": True,
+            "task": _task_dict(kb.get_task(conn, task_id)),
+            "read_only": False,
+        }
+
+
 def _reopen_task_payload(task_id: str, body: dict, *, board=None):
     """Bring a done/archived card back to an open column, with a reason.
 
@@ -1708,6 +1802,9 @@ def handle_kanban_post(handler, parsed, body) -> bool | None:
             if path.startswith(_TASK_PREFIX) and path.endswith(suffix):
                 task_id = path[len(_TASK_PREFIX):-len(suffix)].strip("/")
                 return j(handler, _task_action_payload(task_id, body, action, board=board)) or True
+        if path.startswith(_TASK_PREFIX) and path.endswith("/resume-approved-action-retry"):
+            task_id = path[len(_TASK_PREFIX):-len("/resume-approved-action-retry")].strip("/")
+            return j(handler, _resume_approved_action_retry_payload(task_id, body, board=board)) or True
         if path.startswith(_TASK_PREFIX) and path.endswith("/reopen"):
             task_id = path[len(_TASK_PREFIX):-len("/reopen")].strip("/")
             return j(handler, _reopen_task_payload(task_id, body, board=board)) or True
