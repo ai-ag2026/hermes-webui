@@ -571,6 +571,32 @@ def _patch_task(conn, task_id: str, body: dict):
 
     if status is None:
         return
+    # Human-Gate v1. The Core guards every exit out of blocked/scheduled on a
+    # gated card, but only inside its structured verbs. The direct-write path
+    # below (_set_status_direct) is raw SQL and never consults the gate, so a
+    # gated card could be moved to todo/triage/ready with no token and no audit
+    # trail -- and `todo` is promoted to `ready` by recompute_ready, which hands
+    # it straight to the dispatcher. That is a full bypass of the gate (verified
+    # 2026-07-15), not a cosmetic gap: it is the exact defence the 2026-07-13
+    # incident hardened. The gated 'ready' case reached unblock_task and was
+    # refused, but 'todo'/'triage' -- and 'ready' from `scheduled` -- were not.
+    #
+    # Refuse here, mirroring the agent dashboard (plugin_api.py update_task).
+    # The supported release paths stay open and unchanged: the Unblock button
+    # (_unblock_gate_aware) and exact-action approval both mint + redeem a grant
+    # and leave an audit trail. `done`/`archived` are NOT listed here because
+    # their Core verbs already enforce the gate themselves.
+    if status in ("ready", "triage", "todo"):
+        gate_check = kb.get_task(conn, task_id)
+        if (
+            gate_check is not None
+            and bool(getattr(gate_check, "human_gate", 0))
+            and gate_check.status in ("blocked", "scheduled")
+        ):
+            raise RuntimeError(
+                "human-gated card cannot be moved by a direct status change; "
+                "use Unblock (or approve its exact terminal action) to release it"
+            )
     if status == "done":
         if not kb.complete_task(conn, task_id, result=body.get("result"), summary=body.get("summary")):
             raise LookupError("task not found")
@@ -1003,6 +1029,15 @@ def _approve_exact_action_payload(task_id: str, body: dict, *, board=None):
                 or latest.expires_at <= int(time.time())
             ):
                 raise KanbanGoneError("pending terminal action expired or was already resolved")
+            # The legacy bool seam collapses every cause into False, so name the
+            # one cause an operator can act on. Saying "conflicted with newer
+            # state" for a gate refusal describes a race that never happened and
+            # sends them retrying a click that can never succeed.
+            if bool(getattr(task, "human_gate", 0)) and not gate_token:
+                raise RuntimeError(
+                    "card is human-gated and no gate token could be issued for it; "
+                    "the approval was refused by the gate, not by a state change"
+                )
             raise RuntimeError("exact terminal action approval conflicted with newer state")
         return {
             "ok": True,
