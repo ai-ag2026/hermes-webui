@@ -670,7 +670,20 @@ def _patch_task(conn, task_id: str, body: dict):
                 "restores the card's state properly) instead of a direct status change"
             )
     if status == "done":
-        if not kb.complete_task(conn, task_id, result=body.get("result"), summary=body.get("summary")):
+        # Completing a gated card IS the human deciding -- the same reasoning
+        # _unblock_gate_aware already runs on. Without a token the Core refuses
+        # and the operator gets the raw gate error, which tells them to wait for
+        # an ntfy push or run `hermes kanban gate <id> off` in a shell: a CLI
+        # command with no WebUI equivalent. So the one-click path was simply
+        # broken, and the advice unusable. Mint + redeem server-side, and record
+        # it -- the plaintext token never leaves this function.
+        gate_token = _mint_gate_token_for_operator(
+            conn, task_id, action="complete", note="Abschluss",
+        )
+        if not kb.complete_task(
+            conn, task_id, result=body.get("result"), summary=body.get("summary"),
+            **({"token": gate_token} if gate_token else {}),
+        ):
             raise LookupError("task not found")
     elif status == "blocked":
         if not kb.block_task(conn, task_id, reason=body.get("block_reason") or body.get("reason")):
@@ -1118,6 +1131,47 @@ def _approve_exact_action_payload(task_id: str, body: dict, *, board=None):
         }
 
 
+def _unarchive_task_payload(task_id: str, body: dict, *, board=None):
+    """Undo an archive, restoring the card to what it was.
+
+    Distinct from reopen, and both are needed. Reopen says "this is not finished
+    after all" and therefore clears completed_at/result. Unarchive says "I
+    archived this by mistake" and must NOT: the result is evidence, and a card
+    archived from `done` belongs back in `done` with its result intact.
+
+    Archiving is one click behind a 4-second confirm and, since the H2 removal,
+    needs no grant even for a running card -- but there was no route back on
+    this surface at all, only `hermes kanban unarchive` in a shell. For an
+    operator without CLI access, archived was a one-way street.
+    """
+    kb = _kb()
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        raise ValueError("task_id is required")
+    if not callable(getattr(kb, "unarchive_task", None)):
+        raise RuntimeError("unarchiving is unavailable in this Hermes core")
+    to_status = body.get("to_status")
+    if to_status is not None:
+        to_status = str(to_status).strip()
+        if to_status not in ("todo", "ready", "done"):
+            raise ValueError("to_status must be one of todo|ready|done")
+    with _conn(board=board) as conn:
+        task = kb.get_task(conn, task_id)
+        if task is None:
+            raise LookupError("task not found")
+        if task.status != "archived":
+            raise RuntimeError(
+                f"only an archived card can be unarchived (this one is {task.status})"
+            )
+        if not kb.unarchive_task(conn, task_id, to_status=to_status):
+            raise RuntimeError("unarchive refused: the card changed; refresh and retry")
+        return {
+            "ok": True,
+            "task": _task_dict(kb.get_task(conn, task_id)),
+            "read_only": False,
+        }
+
+
 def _resume_approved_action_retry_payload(task_id: str, body: dict, *, board=None):
     """Retry an approved exact action that a technical failure parked.
 
@@ -1270,6 +1324,45 @@ def _reject_exact_action_payload(task_id: str, body: dict, *, board=None):
             "task": _task_dict(kb.get_task(conn, task_id)),
             "read_only": False,
         }
+
+
+def _mint_gate_token_for_operator(conn, task_id: str, *, action: str, note: str):
+    """Issue + hand back a one-time gate grant for an authenticated operator act.
+
+    The authenticated WebUI operator IS the human the gate exists for (the same
+    reasoning _unblock_gate_aware and the dashboard's gate_off grant run on), so
+    the grant is minted and redeemed server-side and the plaintext never leaves
+    the server. Returns None for an ungated card or one not in a gated state --
+    callers then pass no token at all, leaving that path byte-identical.
+
+    ``action`` must match the transition the Core will validate: grants are
+    action-bound, so an "unblock" token presented to complete_task is refused
+    with "token was issued for a different action". That binding is the point --
+    one grant authorizes one transition, not any exit the holder fancies.
+
+    Every mint is recorded: a gate release with no trace is how the 2026-07-13
+    incident became unreconstructable.
+    """
+    kb = _kb()
+    if not callable(getattr(kb, "issue_gate_token", None)):
+        return None
+    task = kb.get_task(conn, task_id)
+    if task is None or not bool(getattr(task, "human_gate", 0)):
+        return None
+    if getattr(task, "status", None) not in ("blocked", "scheduled"):
+        return None
+    token = kb.issue_gate_token(conn, task_id, action=action)
+    if not token:
+        return None
+    try:
+        kb.add_comment(
+            conn, task_id, "webui",
+            f"GATE-FREIGABE via WebUI ({note}): Token einmalig erzeugt und sofort "
+            "eingelöst durch den eingeloggten Operator",
+        )
+    except Exception:
+        pass
+    return token
 
 
 def _unblock_gate_aware(conn, task_id: str, task, note: str = "") -> bool:
@@ -1802,6 +1895,9 @@ def handle_kanban_post(handler, parsed, body) -> bool | None:
             if path.startswith(_TASK_PREFIX) and path.endswith(suffix):
                 task_id = path[len(_TASK_PREFIX):-len(suffix)].strip("/")
                 return j(handler, _task_action_payload(task_id, body, action, board=board)) or True
+        if path.startswith(_TASK_PREFIX) and path.endswith("/unarchive"):
+            task_id = path[len(_TASK_PREFIX):-len("/unarchive")].strip("/")
+            return j(handler, _unarchive_task_payload(task_id, body, board=board)) or True
         if path.startswith(_TASK_PREFIX) and path.endswith("/resume-approved-action-retry"):
             task_id = path[len(_TASK_PREFIX):-len("/resume-approved-action-retry")].strip("/")
             return j(handler, _resume_approved_action_retry_payload(task_id, body, board=board)) or True

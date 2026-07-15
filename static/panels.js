@@ -3788,9 +3788,15 @@ function _kanbanRenderTaskDetail(data){
   // running/ready, reclaim_task refuses anything not running. On 2026-07-15 a
   // rerun auto-completed a card against its own analyst's advice and the only
   // way back was a raw status write.
+  // done -> reopen ("not finished after all": clears result, waits for a human)
+  // archived -> unarchive ("archived by mistake": restores it as it was)
+  // Two different intents; offering both everywhere would just make the
+  // destructive one easy to hit by accident.
   const taskStatus = String(task.status || '').toLowerCase();
-  const reopenButton = (taskStatus === 'done' || taskStatus === 'archived')
+  const reopenButton = taskStatus === 'done'
     ? `<button class="btn secondary" onclick="reopenKanbanTask(event,'${esc(task.id)}')" title="${esc(t('kanban_reopen_hint'))}">${esc(t('kanban_reopen'))}</button>` : '';
+  const unarchiveButton = taskStatus === 'archived'
+    ? `<button class="btn secondary" onclick="unarchiveKanbanTask(event,'${esc(task.id)}')" title="${esc(t('kanban_unarchive_hint'))}">${esc(t('kanban_unarchive'))}</button>` : '';
   // An approved action whose worker died technically. Nothing resumes it on its
   // own; before 2026-07-15 the only clickable way out was archiving, which
   // cancels the approval the human already gave instead of honouring it.
@@ -3805,7 +3811,7 @@ function _kanbanRenderTaskDetail(data){
     <div class="kanban-task-preview-body">${_kanbanRenderMarkdown(body)}</div>
     ${meta.length ? `<div class="kanban-meta">${esc(meta.join(' · '))}</div>` : ''}
     ${_kanbanAttentionHtml(task, false)}
-    <div class="kanban-status-actions">${statusButtons}${unblockButton}${approveButton}${resumeButton}${rejectButton}${reopenButton}</div>
+    <div class="kanban-status-actions">${statusButtons}${unblockButton}${approveButton}${resumeButton}${rejectButton}${reopenButton}${unarchiveButton}</div>
     <div class="kanban-detail-grid">
       ${_kanbanDetailSection('kanban-detail-comments', String(t('kanban_comments_count')).replace('{0}', comments.length), comments.map(_kanbanCommentHtml).join(''), 'kanban_no_comments')}
       ${_kanbanDetailSection('kanban-detail-events', String(t('kanban_events_count')).replace('{0}', events.length), events.map(_kanbanEventHtml).join(''), 'kanban_no_events')}
@@ -3908,6 +3914,33 @@ async function rejectExactKanbanAction(event, taskId, pendingActionId){
     if (button && button.isConnected) {
       button.disabled = false;
       button.removeAttribute('aria-disabled');
+      button.removeAttribute('aria-busy');
+    }
+  }
+}
+
+// Undo an archive. Unlike reopen this keeps result/completed_at: the card goes
+// back to what it was, because "I archived this by mistake" is not the same
+// statement as "this is not finished after all".
+async function unarchiveKanbanTask(event, taskId){
+  if (!taskId) return;
+  const button = event && event.currentTarget;
+  if (button) { button.disabled = true; button.setAttribute('aria-busy', 'true'); }
+  try {
+    await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + '/unarchive' + _kanbanBoardQuery(), {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+    await loadKanban(true);
+    await loadKanbanTask(taskId);
+    showToast(t('kanban_unarchive_done'), 4000, 'success');
+  } catch(e) {
+    await loadKanban(true).catch(()=>{});
+    await loadKanbanTask(taskId).catch(()=>{});
+    showToast(t('kanban_unavailable') + ': ' + (e.message || e), 6000, 'error');
+  } finally {
+    if (button && button.isConnected) {
+      button.disabled = false;
       button.removeAttribute('aria-busy');
     }
   }

@@ -157,13 +157,18 @@ def test_archiving_a_done_card_still_works(kb_real, bridge):
 
 # --- board view -----------------------------------------------------------
 
-def test_board_renders_a_reopen_button_only_on_terminal_cards():
+def test_board_renders_a_reopen_button_only_on_done_cards():
+    """Reopen belongs on `done`; `archived` gets unarchive instead (WS4).
+
+    Both undo a terminal state but they are different statements -- reopen means
+    "not finished after all" and clears result/completed_at, unarchive means
+    "archived by mistake" and keeps them. Offering both everywhere would put the
+    destructive one one stray click away.
+    """
     panels = (STATIC / "panels.js").read_text(encoding="utf-8")
     assert "reopenKanbanTask(event," in panels
-    assert re.search(
-        r"reopenButton\s*=\s*\(taskStatus === 'done' \|\| taskStatus === 'archived'\)",
-        panels,
-    ), "reopen must only be offered where it applies"
+    assert re.search(r"reopenButton\s*=\s*taskStatus === 'done'", panels)
+    assert re.search(r"unarchiveButton\s*=\s*taskStatus === 'archived'", panels)
     row = re.search(r'<div class="kanban-status-actions">(.*?)</div>', panels, re.S)
     assert "reopenButton" in row.group(1)
 
