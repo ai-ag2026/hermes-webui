@@ -965,8 +965,35 @@ def _approve_exact_action_payload(task_id: str, body: dict, *, board=None):
             raise RuntimeError("pending terminal action changed; refresh before approving")
         if getattr(current, "approved_at", None) is not None:
             raise RuntimeError("pending terminal action was already approved")
+        # Approving an exact action also unblocks the card, so a human_gate=1
+        # card needs an OPEN gate for that half — the Core refuses otherwise and
+        # the refusal surfaces here as an opaque CAS conflict ("conflicted with
+        # newer state"), which reads as a race that never happened. The card is
+        # then unreleasable from the WebUI: /unblock refuses while the exact
+        # action is pending, and this path refuses on the gate.
+        #
+        # The authenticated WebUI operator IS the human the gate exists for, so
+        # mint + redeem a one-time token in the same step — parity with
+        # _unblock_gate_aware and the dashboard's gate_off grant. The plaintext
+        # token never leaves this function. Ungated cards mint nothing and pass
+        # no token, so their path is byte-for-byte unchanged (this also keeps
+        # cores/fakes whose approve seam predates the token parameter working).
+        gate_token = None
+        if bool(getattr(task, "human_gate", 0)) and callable(getattr(kb, "issue_gate_token", None)):
+            gate_token = kb.issue_gate_token(conn, task_id, action="unblock")
+            if gate_token:
+                try:
+                    kb.add_comment(
+                        conn, task_id, "webui",
+                        "GATE-FREIGABE via WebUI-Cockpit für exakte Terminal-Aktion "
+                        f"{action_id} (Token einmalig erzeugt und sofort eingelöst "
+                        "durch den eingeloggten Operator)",
+                    )
+                except Exception:
+                    pass
         result = kb.approve_pending_action_and_unblock(
             conn, task_id, action_id, actor="webui",
+            **({"token": gate_token} if gate_token else {}),
         )
         if not result:
             latest = kb.get_pending_action_by_id(conn, task_id, action_id)
