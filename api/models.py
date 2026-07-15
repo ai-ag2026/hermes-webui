@@ -4140,6 +4140,37 @@ def _evict_sessions_over_cap(cap: int | None = None) -> int:
     return evicted
 
 
+def get_session_for_scan(sid):
+    """Read a session for a one-pass scan without disturbing the LRU.
+
+    ``/api/sessions/search?content=1`` walks EVERY session. Routing that through
+    ``get_session()`` inserts each one into the LRU and marks it recently-used,
+    so a single content search over an install with more sessions than
+    ``sessions_cache_max`` evicts the entire working set the cache exists to
+    hold — the classic buffer-pool scan-pollution problem. The sessions the user
+    actually has open are the ones that get thrown out.
+
+    A scan reads each session exactly once, so nothing it touches has earned
+    "recently used". Resident sessions are reused (free, and deliberately NOT
+    promoted); a miss is read straight from disk and NOT cached.
+
+    Returns ``None`` when the session cannot be read, rather than raising —
+    a scan skips what it cannot open.
+    """
+    with LOCK:
+        cached = SESSIONS.get(sid)  # NB: no move_to_end() — a scan never promotes
+    # Same defensive ownership check as get_session(): never hand back an object
+    # filed under the wrong lineage id.
+    if cached is not None and str(getattr(cached, 'session_id', '') or '') == str(sid):
+        if not getattr(cached, '_loaded_metadata_only', False):
+            return cached
+    try:
+        return Session.load(sid)
+    except Exception:
+        logger.debug("scan load failed for session %s", sid, exc_info=True)
+        return None
+
+
 def get_session(sid, metadata_only=False):
     """Load a session, optionally with metadata only (skipping the messages array).
 
