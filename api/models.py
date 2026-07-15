@@ -4287,6 +4287,14 @@ def _session_is_evictable(s) -> bool:
         on-disk ``message_count`` being at least the in-memory message count.
         A metadata-only stub is inherently backed by disk, so it is evictable.
 
+    The persistence requirement holds even for a session with ZERO messages.
+    ``new_session()`` deliberately does not touch disk until the first message
+    (#1171), so between "New Conversation" and the first send, this cache is the
+    session's ONLY copy. Evicting it does not discard a recreatable empty shell:
+    ``get_session()`` has no recreate path and raises ``KeyError``, so the very
+    next ``/api/session/draft`` or ``/api/chat/start`` 404s and the session can
+    never be started. Sessions the user is still composing must stay resident.
+
     Anything we cannot positively prove is safe stays resident. Using slightly
     more RAM for a session we are unsure about is strictly better than evicting
     an active or unsaved session (task safety invariant: a half-done memory fix
@@ -4308,14 +4316,12 @@ def _session_is_evictable(s) -> bool:
     if getattr(s, '_loaded_metadata_only', False):
         return True
     in_memory_count = len(getattr(s, 'messages', None) or [])
-    if in_memory_count == 0:
-        # A zero-message session has nothing to lose. If it was never persisted
-        # (brand new, no sidecar) dropping it only discards an empty shell; the
-        # next access recreates it. If it is persisted, it is trivially clean.
-        return True
     disk_count = _persisted_message_count(sid)
     if disk_count is None:
         return False  # cannot prove it is on disk → keep it resident
+    if in_memory_count == 0:
+        # Persisted and empty → trivially clean, nothing to lose.
+        return True
     return disk_count >= in_memory_count
 
 

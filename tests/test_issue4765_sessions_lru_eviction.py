@@ -333,3 +333,41 @@ def test_eviction_skips_active_but_still_bounds_clean_entries(isolated_session_e
     # It may briefly sit slightly above cap because actives are non-evictable,
     # but it must NOT grow unbounded with the 40 churned sessions.
     assert len(SESSIONS) <= _cfg.SESSIONS_MAX + len(actives)
+
+
+def test_unsaved_new_session_survives_churn_and_stays_startable(isolated_session_env):
+    """A brand-new, never-persisted session must not be evicted.
+
+    ``new_session()`` keeps a session in RAM only until its first message
+    (#1171), so the cache is its ONLY copy. The original #4765 predicate treated
+    any zero-message session as evictable, reasoning that an empty shell "is
+    recreated on next access" — but ``get_session()`` has no recreate path and
+    raises ``KeyError``, so ``/api/session/draft`` and ``/api/chat/start`` both
+    404 and the session can never be started.
+
+    Real-world trigger: a browser password manager autofilled the sidebar
+    conversation filter, whose content search pulls every hit through
+    ``get_session()``. That churn blew past the cap and dropped the session the
+    user was composing in.
+    """
+    from api import config as _cfg
+    from api.config import SESSIONS
+    from api.models import get_session, new_session
+
+    _cfg.SESSIONS_MAX = 5
+
+    composing = new_session()
+    sid = composing.session_id
+    assert not (_cfg.SESSION_DIR / f"{sid}.json").exists(), (
+        "precondition: new_session() must not persist before the first message"
+    )
+
+    # Content-search-style churn: far more persisted sessions than the cap.
+    for i in range(40):
+        _insert(_make_persisted_session(i))
+
+    assert sid in SESSIONS, "unsaved new session was evicted — its only copy is gone"
+
+    # The chokepoint both failing routes go through.
+    assert get_session(sid, metadata_only=True) is not None
+    assert get_session(sid).session_id == sid
