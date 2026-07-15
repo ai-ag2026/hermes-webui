@@ -3777,6 +3777,13 @@ function _kanbanRenderTaskDetail(data){
   const approvalAttentionId = `kanban-attention-${String(task.id || '').replace(/[^a-zA-Z0-9_-]/g, '-')}`;
   const approveButton = detail && detail.sticky
     ? `<button class="btn primary" onclick="approveExactKanbanAction(event,'${esc(task.id)}','${esc(detail.pending_action_id || '')}')" aria-describedby="${esc(approvalAttentionId)}" title="${esc(exactApproval && exactApproval.available ? t('kanban_approve_exact_action') : t('kanban_exact_action_unavailable'))}" ${exactApproval && exactApproval.available ? '' : 'disabled aria-disabled="true"'}>${esc(t('kanban_approve_exact_action'))}</button>` : '';
+  // "Say no" must sit right next to "say yes". Until 2026-07-15 this view could
+  // only ever approve: on card t_bccbacc4 the agent that raised the action
+  // declared it unnecessary and recommended rejecting it, and there was no
+  // control for that -- it had to be resolved with a direct DB script.
+  const exactReject = detail && detail.actions && detail.actions.reject_exact_action;
+  const rejectButton = detail && detail.sticky && exactReject && exactReject.available
+    ? `<button class="btn secondary danger" onclick="rejectExactKanbanAction(event,'${esc(task.id)}','${esc(detail.pending_action_id || '')}')" aria-describedby="${esc(approvalAttentionId)}" title="${esc(t('kanban_reject_exact_action_hint'))}">${esc(t('kanban_reject_exact_action'))}</button>` : '';
   return `<div class="kanban-task-preview-header">
       <button class="btn secondary kanban-back-btn" onclick="closeKanbanTaskDetail()">${esc(t('kanban_back_to_board'))}</button>
       <div class="kanban-task-preview-title">${esc(title)}</div>
@@ -3785,7 +3792,7 @@ function _kanbanRenderTaskDetail(data){
     <div class="kanban-task-preview-body">${_kanbanRenderMarkdown(body)}</div>
     ${meta.length ? `<div class="kanban-meta">${esc(meta.join(' · '))}</div>` : ''}
     ${_kanbanAttentionHtml(task, false)}
-    <div class="kanban-status-actions">${statusButtons}${unblockButton}${approveButton}</div>
+    <div class="kanban-status-actions">${statusButtons}${unblockButton}${approveButton}${rejectButton}</div>
     <div class="kanban-detail-grid">
       ${_kanbanDetailSection('kanban-detail-comments', String(t('kanban_comments_count')).replace('{0}', comments.length), comments.map(_kanbanCommentHtml).join(''), 'kanban_no_comments')}
       ${_kanbanDetailSection('kanban-detail-events', String(t('kanban_events_count')).replace('{0}', events.length), events.map(_kanbanEventHtml).join(''), 'kanban_no_events')}
@@ -3833,6 +3840,62 @@ async function approveExactKanbanAction(event, taskId, pendingActionId){
       button.removeAttribute('aria-disabled');
       button.removeAttribute('aria-busy');
       button.focus();
+    }
+  }
+}
+
+// Rejecting settles the action WITHOUT running it and deliberately leaves the
+// card blocked -- releasing it stays a separate, conscious act. The reason is
+// mandatory: a rejection discards a worker's request for good, and the board
+// comment is the only lasting record of why.
+async function rejectExactKanbanAction(event, taskId, pendingActionId){
+  if (!taskId || !pendingActionId) {
+    showToast(t('kanban_exact_action_unavailable'), 5000, 'error');
+    return;
+  }
+  const reason = await showPromptDialog({
+    title: t('kanban_reject_exact_action'),
+    message: t('kanban_reject_exact_action_prompt'),
+    placeholder: t('kanban_reject_exact_action_placeholder'),
+    confirmLabel: t('kanban_reject_exact_action'),
+    danger: true,
+  });
+  if (reason == null) return;               // cancelled
+  if (!String(reason).trim()) {
+    showToast(t('kanban_reject_exact_action_reason_required'), 5000, 'error');
+    return;
+  }
+  // Share the approval in-flight guard: approving and rejecting the same action
+  // are mutually exclusive, and letting both fly at once would race the CAS.
+  const key = `${taskId}:${pendingActionId}`;
+  if (_kanbanExactApprovalInflight.has(key)) return;
+  _kanbanExactApprovalInflight.add(key);
+  const button = event && event.currentTarget;
+  if (button) {
+    button.disabled = true;
+    button.setAttribute('aria-disabled', 'true');
+    button.setAttribute('aria-busy', 'true');
+  }
+  try {
+    await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + '/reject-exact-action' + _kanbanBoardQuery(), {
+      method: 'POST',
+      body: JSON.stringify({pending_action_id: pendingActionId, reason: String(reason).trim()}),
+    });
+    await loadKanban(true);
+    await loadKanbanTask(taskId);
+    showToast(t('kanban_reject_exact_action_done'), 4000, 'success');
+  } catch(e) {
+    // Another tab may have approved or rejected it already. Refresh
+    // authoritative state before reporting, like the approval path does.
+    await loadKanban(true).catch(()=>{});
+    await loadKanbanTask(taskId).catch(()=>{});
+    showToast(t('kanban_exact_action_refresh_result') + ': ' + (e.message || e), 6000, 'error');
+  } finally {
+    _kanbanExactApprovalInflight.delete(key);
+    if (button && button.isConnected) {
+      button.disabled = false;
+      button.removeAttribute('aria-disabled');
+      button.removeAttribute('aria-busy');
     }
   }
 }

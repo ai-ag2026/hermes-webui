@@ -210,6 +210,9 @@ def _blocker_details(conn, tasks):
         "get_pending_action", "get_pending_action_by_id",
         "approve_pending_action_and_unblock",
     ))
+    core_can_reject = all(callable(getattr(kb, name, None)) for name in (
+        "get_pending_action", "get_pending_action_by_id", "resolve_pending_action",
+    ))
     for task_id in task_ids:
         action = pending_by_task.get(task_id)
         detail = out.get(task_id)
@@ -261,6 +264,19 @@ def _blocker_details(conn, tasks):
                         "approve-exact-action"
                         if sticky and not action_approved
                         and action_id is not None and core_can_approve else None
+                    ),
+                },
+                # Rejecting stays available on an ALREADY-APPROVED action too:
+                # an approved-but-unconsumed grant is exactly the state an
+                # operator may want to take back, and until it is settled the
+                # card cannot be unblocked either.
+                "reject_exact_action": {
+                    "available": bool(
+                        sticky and action_id is not None and core_can_reject
+                    ),
+                    "endpoint": (
+                        "reject-exact-action"
+                        if sticky and action_id is not None and core_can_reject else None
                     ),
                 },
             },
@@ -1046,6 +1062,70 @@ def _approve_exact_action_payload(task_id: str, body: dict, *, board=None):
         }
 
 
+def _reject_exact_action_payload(task_id: str, body: dict, *, board=None):
+    """Reject one current exact action without ever executing it.
+
+    The 2026-07-15 incident's real lesson: the cockpit could only ever say YES.
+    The analyst that raised the action recommended rejecting it, and there was
+    no way to do that -- the operator had to resolve it with a direct DB script.
+
+    Rejection is NOT approval-with-a-different-word, and deliberately not a
+    gated act: `resolve_pending_action` settles the action without running the
+    command and without unblocking the card, so it needs no gate token (the gate
+    guards *exits from blocked*, and this is not one). The card stays blocked on
+    purpose -- releasing it is a separate, conscious second click.
+    """
+    kb = _kb()
+    task_id = str(task_id or "").strip()
+    raw_action_id = body.get("pending_action_id")
+    if not task_id or raw_action_id in (None, ""):
+        raise ValueError("task_id and pending_action_id are required")
+    try:
+        action_id = int(raw_action_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("pending_action_id must be an integer") from exc
+    reason = str(body.get("reason") or "").strip()
+    if not reason:
+        # A rejection discards a worker's request for good. An unexplained one
+        # is unreadable three weeks later, and the board is the only record.
+        raise ValueError("a reason is required to reject an exact terminal action")
+    if not callable(getattr(kb, "resolve_pending_action", None)):
+        raise RuntimeError("exact terminal action rejection is unavailable in this Hermes core")
+    with _conn(board=board) as conn:
+        if kb.get_task(conn, task_id) is None:
+            raise LookupError("task not found")
+        current = kb.get_pending_action(conn, task_id)
+        if current is None:
+            historical = kb.get_pending_action_by_id(conn, task_id, action_id)
+            if historical is None:
+                raise LookupError("pending terminal action not found")
+            raise KanbanGoneError("pending terminal action expired or was already resolved")
+        if int(current.id) != action_id:
+            raise RuntimeError("pending terminal action changed; refresh before rejecting")
+        result = kb.resolve_pending_action(
+            conn, task_id, action_id, expected_version=int(current.version),
+        )
+        if not result:
+            status = getattr(result, "status", None)
+            if status == "gone":
+                raise KanbanGoneError("pending terminal action expired or was already resolved")
+            if status == "not_found":
+                raise LookupError("pending terminal action not found")
+            raise RuntimeError("rejection refused: the action changed; refresh and retry")
+        # Both the board view and the cockpit reach this route, so the comment
+        # must not claim a specific surface -- the operator is the same human.
+        kb.add_comment(
+            conn, task_id, "webui",
+            f"EXAKTE AKTION ABGELEHNT via WebUI (nicht ausgeführt, Karte bleibt blockiert). "
+            f"Grund: {reason}",
+        )
+        return {
+            "ok": True,
+            "task": _task_dict(kb.get_task(conn, task_id)),
+            "read_only": False,
+        }
+
+
 def _unblock_gate_aware(conn, task_id: str, task, note: str = "") -> bool:
     """Unblock a task from the WebUI, transparently clearing a Human-Gate.
 
@@ -1576,6 +1656,9 @@ def handle_kanban_post(handler, parsed, body) -> bool | None:
             if path.startswith(_TASK_PREFIX) and path.endswith(suffix):
                 task_id = path[len(_TASK_PREFIX):-len(suffix)].strip("/")
                 return j(handler, _task_action_payload(task_id, body, action, board=board)) or True
+        if path.startswith(_TASK_PREFIX) and path.endswith("/reject-exact-action"):
+            task_id = path[len(_TASK_PREFIX):-len("/reject-exact-action")].strip("/")
+            return j(handler, _reject_exact_action_payload(task_id, body, board=board)) or True
         if path.startswith(_TASK_PREFIX) and path.endswith("/approve-exact-action"):
             task_id = path[len(_TASK_PREFIX):-len("/approve-exact-action")].strip("/")
             return j(handler, _approve_exact_action_payload(task_id, body, board=board)) or True
