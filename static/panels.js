@@ -3784,6 +3784,13 @@ function _kanbanRenderTaskDetail(data){
   const exactReject = detail && detail.actions && detail.actions.reject_exact_action;
   const rejectButton = detail && detail.sticky && exactReject && exactReject.available
     ? `<button class="btn secondary danger" onclick="rejectExactKanbanAction(event,'${esc(task.id)}','${esc(detail.pending_action_id || '')}')" aria-describedby="${esc(approvalAttentionId)}" title="${esc(t('kanban_reject_exact_action_hint'))}">${esc(t('kanban_reject_exact_action'))}</button>` : '';
+  // A terminal card has no way back without this: block_task takes only
+  // running/ready, reclaim_task refuses anything not running. On 2026-07-15 a
+  // rerun auto-completed a card against its own analyst's advice and the only
+  // way back was a raw status write.
+  const taskStatus = String(task.status || '').toLowerCase();
+  const reopenButton = (taskStatus === 'done' || taskStatus === 'archived')
+    ? `<button class="btn secondary" onclick="reopenKanbanTask(event,'${esc(task.id)}')" title="${esc(t('kanban_reopen_hint'))}">${esc(t('kanban_reopen'))}</button>` : '';
   return `<div class="kanban-task-preview-header">
       <button class="btn secondary kanban-back-btn" onclick="closeKanbanTaskDetail()">${esc(t('kanban_back_to_board'))}</button>
       <div class="kanban-task-preview-title">${esc(title)}</div>
@@ -3792,7 +3799,7 @@ function _kanbanRenderTaskDetail(data){
     <div class="kanban-task-preview-body">${_kanbanRenderMarkdown(body)}</div>
     ${meta.length ? `<div class="kanban-meta">${esc(meta.join(' · '))}</div>` : ''}
     ${_kanbanAttentionHtml(task, false)}
-    <div class="kanban-status-actions">${statusButtons}${unblockButton}${approveButton}${rejectButton}</div>
+    <div class="kanban-status-actions">${statusButtons}${unblockButton}${approveButton}${rejectButton}${reopenButton}</div>
     <div class="kanban-detail-grid">
       ${_kanbanDetailSection('kanban-detail-comments', String(t('kanban_comments_count')).replace('{0}', comments.length), comments.map(_kanbanCommentHtml).join(''), 'kanban_no_comments')}
       ${_kanbanDetailSection('kanban-detail-events', String(t('kanban_events_count')).replace('{0}', events.length), events.map(_kanbanEventHtml).join(''), 'kanban_no_events')}
@@ -3895,6 +3902,44 @@ async function rejectExactKanbanAction(event, taskId, pendingActionId){
     if (button && button.isConnected) {
       button.disabled = false;
       button.removeAttribute('aria-disabled');
+      button.removeAttribute('aria-busy');
+    }
+  }
+}
+
+// Reopening lands the card in `blocked`, never `ready`: on 2026-07-15 a card
+// released to ready was re-claimed by the dispatcher within 50 seconds and
+// re-ran a finished audit before the operator could decide anything.
+async function reopenKanbanTask(event, taskId){
+  if (!taskId) return;
+  const reason = await showPromptDialog({
+    title: t('kanban_reopen'),
+    message: t('kanban_reopen_prompt'),
+    placeholder: t('kanban_reopen_placeholder'),
+    confirmLabel: t('kanban_reopen'),
+  });
+  if (reason == null) return;
+  if (!String(reason).trim()) {
+    showToast(t('kanban_reopen_reason_required'), 5000, 'error');
+    return;
+  }
+  const button = event && event.currentTarget;
+  if (button) { button.disabled = true; button.setAttribute('aria-busy', 'true'); }
+  try {
+    await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + '/reopen' + _kanbanBoardQuery(), {
+      method: 'POST',
+      body: JSON.stringify({reason: String(reason).trim(), to_status: 'blocked'}),
+    });
+    await loadKanban(true);
+    await loadKanbanTask(taskId);
+    showToast(t('kanban_reopen_done'), 4000, 'success');
+  } catch(e) {
+    await loadKanban(true).catch(()=>{});
+    await loadKanbanTask(taskId).catch(()=>{});
+    showToast(t('kanban_unavailable') + ': ' + (e.message || e), 6000, 'error');
+  } finally {
+    if (button && button.isConnected) {
+      button.disabled = false;
       button.removeAttribute('aria-busy');
     }
   }

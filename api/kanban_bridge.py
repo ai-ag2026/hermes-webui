@@ -613,6 +613,17 @@ def _patch_task(conn, task_id: str, body: dict):
                 "human-gated card cannot be moved by a direct status change; "
                 "use Unblock (or approve its exact terminal action) to release it"
             )
+        # Leaving a terminal state is a reopen, and a reopen has obligations the
+        # raw path cannot meet: clear completed_at/result (or the card claims to
+        # be open and finished at once, and every duration metric lies), demote
+        # children that were ready only because this parent was done, and record
+        # WHY. _set_status_direct below has no source-status restriction at all,
+        # so a drag from Done quietly did none of that. Route it through the verb.
+        if gate_check is not None and gate_check.status in ("done", "archived"):
+            raise RuntimeError(
+                "reopen refused: use the reopen action (it needs a reason and "
+                "restores the card's state properly) instead of a direct status change"
+            )
     if status == "done":
         if not kb.complete_task(conn, task_id, result=body.get("result"), summary=body.get("summary")):
             raise LookupError("task not found")
@@ -1055,6 +1066,47 @@ def _approve_exact_action_payload(task_id: str, body: dict, *, board=None):
                     "the approval was refused by the gate, not by a state change"
                 )
             raise RuntimeError("exact terminal action approval conflicted with newer state")
+        return {
+            "ok": True,
+            "task": _task_dict(kb.get_task(conn, task_id)),
+            "read_only": False,
+        }
+
+
+def _reopen_task_payload(task_id: str, body: dict, *, board=None):
+    """Bring a done/archived card back to an open column, with a reason.
+
+    Until 2026-07-15 there was no verb for this at all: a rerun auto-completed
+    card t_bccbacc4 against its own analyst's advice, and the only way back was a
+    raw status write. A later agent hit the identical wall and said so on the
+    card: "could not block t_bccbacc4 (unknown id or not in running/ready)".
+
+    Lands in `blocked` by default -- NOT `ready`. On 2026-07-15 the card was
+    released to `ready` and the dispatcher re-claimed it within 50 seconds,
+    re-running a finished audit before anyone could decide anything.
+    """
+    kb = _kb()
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        raise ValueError("task_id is required")
+    reason = str(body.get("reason") or "").strip()
+    if not reason:
+        raise ValueError("a reason is required to reopen a card")
+    to_status = str(body.get("to_status") or "blocked").strip()
+    if to_status not in ("blocked", "todo"):
+        raise ValueError("to_status must be one of blocked|todo")
+    if not callable(getattr(kb, "reopen_task", None)):
+        raise RuntimeError("reopening is unavailable in this Hermes core")
+    with _conn(board=board) as conn:
+        task = kb.get_task(conn, task_id)
+        if task is None:
+            raise LookupError("task not found")
+        if task.status not in ("done", "archived"):
+            raise RuntimeError(
+                f"only a done or archived card can be reopened (this one is {task.status})"
+            )
+        if not kb.reopen_task(conn, task_id, actor="webui", reason=reason, to_status=to_status):
+            raise RuntimeError("reopen refused: the card changed; refresh and retry")
         return {
             "ok": True,
             "task": _task_dict(kb.get_task(conn, task_id)),
@@ -1656,6 +1708,9 @@ def handle_kanban_post(handler, parsed, body) -> bool | None:
             if path.startswith(_TASK_PREFIX) and path.endswith(suffix):
                 task_id = path[len(_TASK_PREFIX):-len(suffix)].strip("/")
                 return j(handler, _task_action_payload(task_id, body, action, board=board)) or True
+        if path.startswith(_TASK_PREFIX) and path.endswith("/reopen"):
+            task_id = path[len(_TASK_PREFIX):-len("/reopen")].strip("/")
+            return j(handler, _reopen_task_payload(task_id, body, board=board)) or True
         if path.startswith(_TASK_PREFIX) and path.endswith("/reject-exact-action"):
             task_id = path[len(_TASK_PREFIX):-len("/reject-exact-action")].strip("/")
             return j(handler, _reject_exact_action_payload(task_id, body, board=board)) or True
