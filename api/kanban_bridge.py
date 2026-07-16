@@ -1315,11 +1315,11 @@ def _reject_exact_action_payload(task_id: str, body: dict, *, board=None):
         action_id = int(raw_action_id)
     except (TypeError, ValueError) as exc:
         raise ValueError("pending_action_id must be an integer") from exc
+    # The reason is optional by operator decision (2026-07-16): the two-click
+    # arm already guards against stray clicks, and forcing prose produced
+    # filler text, not audit value. An empty reason is still recorded as such
+    # so the board shows a deliberate, unexplained rejection — not a gap.
     reason = str(body.get("reason") or "").strip()
-    if not reason:
-        # A rejection discards a worker's request for good. An unexplained one
-        # is unreadable three weeks later, and the board is the only record.
-        raise ValueError("a reason is required to reject an exact terminal action")
     if not callable(getattr(kb, "resolve_pending_action", None)):
         raise RuntimeError("exact terminal action rejection is unavailable in this Hermes core")
     with _conn(board=board) as conn:
@@ -1347,8 +1347,8 @@ def _reject_exact_action_payload(task_id: str, body: dict, *, board=None):
         # must not claim a specific surface -- the operator is the same human.
         kb.add_comment(
             conn, task_id, "webui",
-            f"EXAKTE AKTION ABGELEHNT via WebUI (nicht ausgeführt, Karte bleibt blockiert). "
-            f"Grund: {reason}",
+            "EXAKTE AKTION ABGELEHNT via WebUI (nicht ausgeführt, Karte bleibt blockiert). "
+            + (f"Grund: {reason}" if reason else "Ohne Begründung abgelehnt."),
         )
         return {
             "ok": True,

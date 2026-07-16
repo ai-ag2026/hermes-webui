@@ -132,19 +132,26 @@ def test_reject_records_the_reason_on_the_board(kb_real, bridge):
     assert any("ABGELEHNT" in b for b in bodies)
 
 
-def test_reject_requires_a_reason(kb_real, bridge):
+def test_reject_without_a_reason_succeeds_and_is_marked(kb_real, bridge):
+    """Operator decision 2026-07-16: the reason is optional. An empty one must
+    still leave a deliberate mark on the board — not a silent gap."""
     kb = kb_real
     with kb.connect() as conn:
         task_id, action_id = _card_with_pending_exact_action(kb, conn)
 
-    for bad_reason in ({}, {"reason": ""}, {"reason": "   "}):
-        with pytest.raises(ValueError):
-            bridge._reject_exact_action_payload(
-                task_id, {"pending_action_id": action_id, **bad_reason}
-            )
+    result = bridge._reject_exact_action_payload(
+        task_id, {"pending_action_id": action_id, "reason": "   "}
+    )
 
+    assert result["ok"] is True
     with kb.connect() as conn:
-        assert kb.get_pending_action(conn, task_id) is not None, "refusal must be inert"
+        assert kb.get_pending_action(conn, task_id) is None
+        assert kb.get_task(conn, task_id).status == "blocked"
+        bodies = [r[0] for r in conn.execute(
+            "SELECT body FROM task_comments WHERE task_id=? ORDER BY id", (task_id,)
+        ).fetchall()]
+    assert any("Ohne Begründung abgelehnt" in b for b in bodies)
+    assert not any("Grund:  " in b for b in bodies)
 
 
 def test_rejecting_an_already_rejected_action_is_gone_not_a_crash(kb_real, bridge):

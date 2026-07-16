@@ -3880,10 +3880,9 @@ async function rejectExactKanbanAction(event, taskId, pendingActionId){
     danger: true,
   });
   if (reason == null) return;               // cancelled
-  if (!String(reason).trim()) {
-    showToast(t('kanban_reject_exact_action_reason_required'), 5000, 'error');
-    return;
-  }
+  // The reason is optional (operator decision 2026-07-16): confirming the
+  // danger dialog with an empty field is a deliberate act, and the bridge
+  // records an explicit "ohne Begründung" mark on the board.
   // Share the approval in-flight guard: approving and rejecting the same action
   // are mutually exclusive, and letting both fly at once would race the CAS.
   const key = `${taskId}:${pendingActionId}`;

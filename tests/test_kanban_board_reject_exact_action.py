@@ -58,13 +58,17 @@ def test_reject_posts_to_its_own_endpoint_with_a_reason(panels):
     assert "_kanbanBoardQuery()" in handler, "multi-board routing must be preserved"
 
 
-def test_reject_requires_a_reason_and_can_be_cancelled(panels):
+def test_reject_reason_is_optional_but_cancel_still_aborts(panels):
+    """Operator decision 2026-07-16: the reason is optional. Cancelling the
+    dialog must still abort — only a confirmed dialog (even empty) sends."""
     handler = panels[panels.index("async function rejectExactKanbanAction"):]
     handler = handler[:handler.index("async function loadKanbanTask")]
     assert "showPromptDialog(" in handler, "reason is collected, not assumed"
     assert "danger: true" in handler
     assert "if (reason == null) return;" in handler, "cancel must abort, not send empty"
-    assert "kanban_reject_exact_action_reason_required" in handler
+    assert "kanban_reject_exact_action_reason_required" not in handler, (
+        "the mandatory-reason refusal must be gone"
+    )
 
 
 def test_reject_shares_the_approval_inflight_guard(panels):
