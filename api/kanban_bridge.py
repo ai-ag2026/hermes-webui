@@ -254,9 +254,17 @@ def _blocker_details(conn, tasks):
             and attention_type in ("capability", "transient")
         )
         if sticky:
-            # Exact-action transport is opaque. Ignore arbitrary blocker-event
-            # prose here: it may predate Core redaction or contain a raw command.
-            detail["human_summary"] = _safe_exact_action_summary(
+            # Exact-action transport is opaque, so we never trust the raw action
+            # row or arbitrary blocker-EVENT prose (either may carry a raw command
+            # or secret). But the ATTENTION is Core's curated *public projection*:
+            # its summary is the operator-facing pattern description Core mirrors
+            # in on record (_upsert_exact_action_attention). Prefer it so the
+            # cockpit can say WHY the card is blocked -- the exact same trust
+            # boundary the dashboard plugin uses (plugin_api._attention_dict, which
+            # reads attention.summary and never the action). Fall back to the
+            # generic constant when no live projection carries a summary.
+            _stored = (getattr(attention, "summary", None) or "").strip()
+            detail["human_summary"] = _stored or _safe_exact_action_summary(
                 getattr(action, "summary", None)
             )
             detail["reason"] = (
