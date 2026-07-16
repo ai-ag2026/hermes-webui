@@ -6,18 +6,29 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import threading
 import time
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 try:  # optional fast JSON codec for the session-save hotpath (big sessions)
     import orjson as _orjson
 except ImportError:  # pragma: no cover - environment without orjson
     _orjson = None
+
+try:  # pragma: no cover - platform-specific imports.
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover
+    _fcntl = None
+
+try:  # pragma: no cover - platform-specific imports.
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover
+    _msvcrt = None
 
 import api.config as _cfg
 from api.compression_anchor import is_context_compression_marker
@@ -48,14 +59,25 @@ WEBHOOK_PROJECT_CHIP_LIMIT = 200
 _CLI_SESSIONS_CACHE_TTL_SECONDS = 5.0
 # While a turn is actively streaming, hold the CLI/cron projection longer than
 # one poll interval (mirrors the route-level #4808 hold-down). The frontend
-# polls /api/sessions every ~5s during a stream; without a wider window the
-# CLI cache key advances on every streamed message row (see below) and the
-# expensive state.db CLI/cron projection is re-run on every poll. (#4842)
-_CLI_SESSIONS_CACHE_STREAMING_TTL_SECONDS = 30.0
+# polls /api/sessions on the static/sessions.js `_streamingPollMs` cadence.
+# Pair this wider window with the stable streaming cache key below so repeated
+# polls reuse the projection instead of re-running the expensive state.db
+# CLI/cron projection. (#4842) Keep this strictly greater than
+# `_streamingPollMs`/1000 (see tests/test_streaming_cache_ttl_vs_poll.py).
+_CLI_SESSIONS_CACHE_STREAMING_TTL_SECONDS = 45.0
 _CLI_SESSIONS_CACHE_LOCK = threading.Lock()
 _CLI_SESSIONS_CACHE_INFLIGHT: "dict[tuple, threading.Event]" = {}
 _CLI_SESSIONS_CACHE_INVALIDATION_VERSION = 0
-_CLI_SESSIONS_CACHE = {}
+# LRU-bounded (drop-oldest) so a long-lived process under churn — where the
+# state.db fingerprint advances on every streamed message and the structural
+# clear-on-mutation listener doesn't fire for every fingerprint advance — can't
+# accumulate orphaned heavy deepcopies. Each value is a copy.deepcopy() of the
+# full CLI/cron session list (the expensive projection behind #4842/#4672), so
+# the cap is deliberately small. TTL is still the primary freshness control;
+# the cap is the backstop that the plain dict previously lacked. Mirrors the
+# _CLAUDE_CODE_PARSE_CACHE / _SIDECAR_METADATA_CACHE LRU pattern.
+_CLI_SESSIONS_CACHE: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
+_CLI_SESSIONS_CACHE_MAX_ENTRIES = 8
 _CLI_SESSIONS_CACHE_WAIT_SECONDS = 0.25
 # Event waits that keep stale rows visible while a rebuild is in flight.
 _CLI_SESSIONS_CACHE_STALE_WAIT_SECONDS = 0.10
@@ -87,7 +109,7 @@ _CLAUDE_CODE_PARSE_CACHE_MAX = 1000
 # ~200 sidecar file reads per /api/sessions build — and because the enclosing
 # _CLI_SESSIONS_CACHE is keyed on a state.db content fingerprint that advances
 # on every streamed message row, that whole scan was re-paid on essentially
-# every 5s poll during a live turn (the "100% CPU / multi-second get_cli_sessions"
+# every streaming poll during a live turn (the "100% CPU / multi-second get_cli_sessions"
 # in #4842/#4808/#4672). This memoizes the parse result keyed by the sidecar's
 # (path, mtime_ns, size, ctime_ns) stat signature: a warm projection re-stats
 # each file (~1 stat) instead of re-reading+parsing it, while any genuine
@@ -4274,6 +4296,35 @@ def _persisted_session_meta_prefix(sid) -> dict | None:
         return None
 
 
+def _session_sidecar_exists(sid) -> bool | None:
+    """Return whether *sid*'s sidecar file exists on disk.
+
+    True  = the sidecar is confirmed present.
+    False = the sidecar is confirmed absent (a truly never-persisted session).
+    None  = existence is indeterminate (unsafe id, or the stat raised).
+
+    ``_session_is_evictable`` uses this to distinguish a genuinely
+    never-persisted empty shell (safe to grace-evict once abandoned) from a
+    session whose count merely could not be read this pass (stay resident).
+    """
+    if not is_safe_session_id(sid):
+        return None
+    try:
+        return (SESSION_DIR / f'{sid}.json').exists()
+    except OSError:
+        return None
+
+
+# Grace window (seconds) during which a never-persisted, empty, draftless session
+# shell is protected from LRU eviction. new_session() defers the first disk write
+# only in the SESSIONS cache; evicting it there permanently 404s the chat (#6083).
+# After this window a still-empty, still-draftless, never-saved shell is treated as
+# abandoned and becomes evictable again, so these shells can't grow unbounded past
+# the cache cap. Generous (30 min) so a user composing slowly is never dropped;
+# a real draft persists to disk on the first keystroke and is reloadable anyway.
+_UNSAVED_SHELL_GRACE_S = 1800
+
+
 def _session_is_evictable(s) -> bool:
     """Return True only when *s* can be safely dropped from the LRU (#4765).
 
@@ -4287,18 +4338,30 @@ def _session_is_evictable(s) -> bool:
         on-disk ``message_count`` being at least the in-memory message count.
         A metadata-only stub is inherently backed by disk, so it is evictable.
 
-    The persistence requirement holds even for a session with ZERO messages.
-    ``new_session()`` deliberately does not touch disk until the first message
-    (#1171), so between "New Conversation" and the first send, this cache is the
-    session's ONLY copy. Evicting it does not discard a recreatable empty shell:
-    ``get_session()`` has no recreate path and raises ``KeyError``, so the very
-    next ``/api/session/draft`` or ``/api/chat/start`` 404s and the session can
-    never be started. Sessions the user is still composing must stay resident.
+    The persistence requirement holds even for a session with ZERO messages,
+    but only for a bounded grace window. ``new_session()`` deliberately does not
+    touch disk until the first message (#1171), so between "New Conversation" and
+    the first send this cache is the session's ONLY copy. Evicting it there
+    discards an un-recreatable shell: ``get_session()`` has no recreate path and
+    raises ``KeyError``, so the very next ``/api/session/draft`` or
+    ``/api/chat/start`` 404s and the session can never be started (#6083). We
+    therefore protect a never-persisted empty shell while it is fresh (the user
+    just opened it and is composing) OR while it has an active composer draft.
 
-    Anything we cannot positively prove is safe stays resident. Using slightly
-    more RAM for a session we are unsure about is strictly better than evicting
-    an active or unsaved session (task safety invariant: a half-done memory fix
-    that loses a session is worse than none).
+    A never-persisted empty shell that is BOTH stale (older than
+    ``_UNSAVED_SHELL_GRACE_S``) AND draftless is treated as an abandoned
+    "New Conversation" tab the user opened and walked away from — it becomes
+    evictable again so ``sessions_cache_max`` still bounds these shells and they
+    cannot accumulate without limit (a slow leak / OOM on installs that open many
+    empty chats). Anything the user is actually composing persists a draft via
+    ``s.save()`` on the first keystroke, so it is disk-backed and reloadable well
+    before the grace window expires; the window only covers the empty-and-untouched
+    gap right after "New Conversation".
+
+    Anything else we cannot positively prove is safe stays resident. Using
+    slightly more RAM for a session we are unsure about is strictly better than
+    evicting an active or unsaved session (task safety invariant: a half-done
+    memory fix that loses a session is worse than none).
     """
     if s is None:
         return True  # nothing to protect; let the caller drop it
@@ -4318,7 +4381,32 @@ def _session_is_evictable(s) -> bool:
     in_memory_count = len(getattr(s, 'messages', None) or [])
     disk_count = _persisted_message_count(sid)
     if disk_count is None:
-        return False  # cannot prove it is on disk → keep it resident
+        # disk_count is None for TWO distinct reasons: the sidecar is confirmed
+        # absent (truly never persisted → this cache is the only copy), OR the
+        # sidecar exists but its count could not be read this pass (transient I/O,
+        # mid-write). Only the CONFIRMED-ABSENT case is eligible for grace-based
+        # shell eviction; an indeterminate existing-sidecar session stays resident
+        # (conservative — never grace-evict something we cannot prove is gone).
+        if in_memory_count > 0:
+            return False  # holds unsaved messages → never drop
+        composer_draft = getattr(s, 'composer_draft', None)
+        if composer_draft:
+            return False  # user is composing (draft present) → keep resident
+        if _session_sidecar_exists(sid) is not False:
+            # Sidecar present or existence indeterminate → not a never-persisted
+            # shell; do not enter the abandoned-shell grace path.
+            return False
+        # Confirmed never-persisted empty draftless shell. Protect it while fresh
+        # (the compose window right after "New Conversation"); once stale it is an
+        # abandoned tab and becomes evictable so these shells cannot accumulate
+        # unbounded past the cache cap (#6083 follow-up).
+        created_at = getattr(s, 'created_at', None)
+        if isinstance(created_at, (int, float)):
+            if (time.time() - created_at) <= _UNSAVED_SHELL_GRACE_S:
+                return False  # fresh empty shell → protect the compose window
+            return True  # stale, empty, draftless, never-saved → abandoned, evictable
+        # No usable created_at timestamp → be conservative, keep it resident.
+        return False
     if in_memory_count == 0:
         # Persisted and empty → trivially clean, nothing to lose.
         return True
@@ -5452,13 +5540,16 @@ def _read_state_db_sidebar_overrides(
             has_messages_table = cur.fetchone() is not None
             messages_has_session_id = False
             messages_has_timestamp = False
+            messages_has_title_fields = False
             if has_messages_table:
                 cur.execute("PRAGMA table_info(messages)")
                 message_cols = {str(row[1]) for row in cur.fetchall()}
                 messages_has_session_id = 'session_id' in message_cols
                 messages_has_timestamp = 'timestamp' in message_cols
+                messages_has_title_fields = {'session_id', 'role', 'content', 'timestamp'}.issubset(message_cols)
 
             overrides: dict[str, dict] = {}
+            delegated_title_ids: set[str] = set()
             ids = list(wanted)
             chunk_size = 500
             for i in range(0, len(ids), chunk_size):
@@ -5479,6 +5570,12 @@ def _read_state_db_sidebar_overrides(
                     if state_title:
                         entry['_state_db_title'] = state_title
                     state_source = str(row['source'] or '').strip().lower()
+                    if (
+                        state_source == 'subagent'
+                        and sid in count_wanted
+                        and ' '.join(state_title.split()) == 'Subagent Session'
+                    ):
+                        delegated_title_ids.add(sid)
                     if state_source:
                         entry['_state_db_source'] = state_source
                         source_meta = normalize_agent_session_source(state_source)
@@ -5523,6 +5620,29 @@ def _read_state_db_sidebar_overrides(
                                 entry['_state_db_last_message_at'] = float(row['last_message_at'] or 0)
                             except (TypeError, ValueError):
                                 pass
+            if messages_has_title_fields and delegated_title_ids:
+                seen_user_messages: set[str] = set()
+                delegated_title_ids = list(delegated_title_ids)
+                for i in range(0, len(delegated_title_ids), chunk_size):
+                    chunk = delegated_title_ids[i:i + chunk_size]
+                    placeholders = ','.join('?' * len(chunk))
+                    cur.execute(
+                        f"""
+                        SELECT session_id, role, content, timestamp
+                        FROM messages
+                        WHERE session_id IN ({placeholders}) AND role = 'user'
+                        ORDER BY session_id, timestamp ASC
+                        """,
+                        chunk,
+                    )
+                    for row in cur.fetchall():
+                        sid = str(row['session_id'])
+                        if sid in seen_user_messages:
+                            continue
+                        display_title = title_from([dict(row)], fallback='')
+                        if display_title:
+                            seen_user_messages.add(sid)
+                            overrides.setdefault(sid, {})['_state_db_display_title'] = display_title
             return overrides
     except Exception:
         return {}
@@ -5577,6 +5697,7 @@ def _apply_sidebar_state_db_override_metadata(sessions: list[dict], metadata: di
         state_db_source_label = entry.pop('_state_db_source_label', None)
         state_db_message_count = entry.pop('_state_db_message_count', None)
         state_db_last_message_at = entry.pop('_state_db_last_message_at', None)
+        state_db_display_title = entry.pop('_state_db_display_title', None)
         if state_db_source == 'webui':
             session['source_tag'] = state_db_source_tag
             session['raw_source'] = state_db_raw_source
@@ -5636,6 +5757,12 @@ def _apply_sidebar_state_db_override_metadata(sessions: list[dict], metadata: di
         ):
             session['_state_db_title'] = state_db_title
             session['display_title'] = state_db_title
+        if (
+            state_db_display_title
+            and state_db_source == 'subagent'
+            and ' '.join(str(title or '').split()) == 'Subagent Session'
+        ):
+            session['display_title'] = state_db_display_title
 
 
 def _enrich_sidebar_lineage_metadata(sessions: list[dict]) -> None:
@@ -5907,6 +6034,8 @@ def title_from(messages, fallback: str='Untitled'):
     for m in messages:
         if m.get('role') == 'user':
             c = m.get('content', '')
+            if c is None:
+                continue
             if isinstance(c, list):
                 c = ' '.join(p.get('text', '') for p in c if isinstance(p, dict) and p.get('type') == 'text')
             text = _strip_attached_files_marker(str(c))
@@ -6558,6 +6687,9 @@ def _cache_cli_sessions_if_current(
             invalidation_stamp,
             _copy_cli_sessions(sessions),
         )
+        _CLI_SESSIONS_CACHE.move_to_end(cache_key)
+        while len(_CLI_SESSIONS_CACHE) > _CLI_SESSIONS_CACHE_MAX_ENTRIES:
+            _CLI_SESSIONS_CACHE.popitem(last=False)
     return True
 
 
@@ -6576,6 +6708,8 @@ def _copy_fresh_cli_sessions_cache_entry(cache_key: tuple):
             return None
         if cached_expires_at <= time.monotonic():
             return None
+        # LRU: a fresh hit is the most-recently-used entry.
+        _CLI_SESSIONS_CACHE.move_to_end(cache_key)
         return _copy_cli_sessions(cached_sessions)
 
 
@@ -6669,7 +6803,7 @@ def _reload_cli_sessions_after_inflight(
 
 def _cli_sessions_cache_ttl_seconds() -> float:
     # #4842: widen the freshness window while a turn is streaming so the fixed
-    # ~5s streaming poll cadence doesn't force a rebuild on every poll. Paired
+    # streaming poll cadence doesn't force a rebuild on every poll. Paired
     # with the streaming-freeze cache key (so the key is stable across polls
     # mid-stream), this bounds the heavy CLI/cron projection to one rebuild per
     # streaming-TTL window instead of one per poll. Mirrors the route-level
@@ -6827,8 +6961,9 @@ def _cli_sessions_streaming_freeze_marker():
     in-app structural mutation invalidates the cache directly via
     ``clear_cli_sessions_cache``. Externally-driven changes that don't fire that
     listener (a scheduled cron completing, an external CLI writing rows) surface
-    within one streaming-TTL window (≤30s) rather than instantly — a bounded,
-    self-healing lag that is the deliberate latency/CPU trade-off of the freeze. (#4842)
+    after the streaming TTL expires and a subsequent refresh occurs rather than
+    instantly — a bounded, self-healing lag that is the deliberate latency/CPU
+    trade-off of the freeze. (#4842)
     """
     try:
         active = _active_stream_ids()
@@ -6868,9 +7003,9 @@ def _resolve_cli_sessions_context(source_filter=None, include_claude_code: bool 
     # #4842: while a turn streams, freeze the volatile state.db component of the
     # key so per-message writes don't bust the CLI cache and re-run the heavy
     # CLI/cron projection on every poll (mirrors the route-level #4808 freeze).
-    # The wider streaming TTL in get_cli_sessions() still forces a periodic
-    # rebuild so a streaming session's own count stays fresh within that window,
-    # and structural mutations invalidate via clear_cli_sessions_cache().
+    # The wider streaming TTL in get_cli_sessions() still permits a periodic
+    # rebuild after that window, and structural mutations invalidate via
+    # clear_cli_sessions_cache().
     _streaming_marker = _cli_sessions_streaming_freeze_marker()
     db_state_key = _streaming_marker if _streaming_marker is not None else _sqlite_file_stat_cache_key(db_path)
     cache_key = (
@@ -7424,6 +7559,8 @@ def get_cli_sessions(
                 if cached_stamp != _CLI_SESSIONS_CACHE_INVALIDATION_VERSION:
                     _CLI_SESSIONS_CACHE.pop(cache_key, None)
                 elif cached_expires_at > now:
+                    # LRU: a fresh hit is the most-recently-used entry.
+                    _CLI_SESSIONS_CACHE.move_to_end(cache_key)
                     return _copy_cli_sessions(cached_sessions)
                 else:
                     stale_sessions = _copy_cli_sessions(cached_sessions)
@@ -8873,31 +9010,599 @@ def count_conversation_rounds(sid: str, since: float | None = None) -> int:
 CONVERSATION_ROUND_THRESHOLD = 10
 
 
-def delete_cli_session(sid) -> bool:
-    """Delete a CLI session from state.db (messages + session row).
-    Returns True if deleted, False if not found or error.
+@contextmanager
+def _cleanup_manifest_process_lock(hermes_home):
+    """Serialize cleanup across WebUI worker processes for one profile.
+
+    Keep the lock file in place permanently: unlinking it while another process
+    is waiting can split later callers across different inodes and defeat the
+    lock. POSIX uses ``flock``; native Windows locks the first byte with
+    ``msvcrt.locking``. If neither primitive exists, fail closed rather than
+    running destructive cleanup without cross-process serialization.
     """
-    import os
+    lock_path = Path(hermes_home) / ".session_cleanup.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(fd, "r+b", buffering=0) as lock_file:
+        if _fcntl is not None:
+            _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_UN)
+            return
+
+        if _msvcrt is not None:
+            if os.fstat(lock_file.fileno()).st_size == 0:
+                lock_file.write(b"\0")
+            lock_file.seek(0)
+            _msvcrt.locking(  # type: ignore[attr-defined]
+                lock_file.fileno(), _msvcrt.LK_LOCK, 1  # type: ignore[attr-defined]
+            )
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                _msvcrt.locking(  # type: ignore[attr-defined]
+                    lock_file.fileno(), _msvcrt.LK_UNLCK, 1  # type: ignore[attr-defined]
+                )
+            return
+
+        raise RuntimeError("cross-process session cleanup locking is unavailable")
+
+
+_cleanup_manifest_locks_guard = threading.Lock()
+_cleanup_manifest_locks = {}
+
+
+def _cleanup_manifest_thread_lock(hermes_home):
+    """Return the in-process cleanup lock for one resolved profile home."""
+    key = os.fspath(Path(hermes_home))
+    with _cleanup_manifest_locks_guard:
+        lock = _cleanup_manifest_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _cleanup_manifest_locks[key] = lock
+        return lock
+
+
+def delete_cli_session(sid) -> bool:
+    """Delete a CLI session while serializing manifest and DB cleanup."""
+    try:
+        from api.profiles import get_active_hermes_home
+        hermes_home = Path(get_active_hermes_home()).expanduser().resolve()
+    except Exception:
+        logger.warning("Failed to resolve active profile for session delete", exc_info=True)
+        return False
+    try:
+        with _cleanup_manifest_thread_lock(hermes_home):
+            with _cleanup_manifest_process_lock(hermes_home):
+                return _delete_cli_session_locked(sid, hermes_home)
+    except Exception:
+        logger.warning("Failed to delete CLI session %s from state.db", sid, exc_info=True)
+        return False
+
+
+def _delete_cli_session_locked(sid, hermes_home) -> bool:
+    """Delete a CLI session from state.db using Hermes' session semantics.
+
+    A scoped transaction implements the Agent invariant while giving branch and
+    compression evidence precedence over inherited delegate metadata. Current
+    Hermes Agent's canonical helper does not yet make that precedence guarantee,
+    so this destructive path fails closed instead of delegating to it.
+
+    Returns True when the requested state is absent after cleanup, False on an
+    operational error.
+    """
     try:
         import sqlite3
     except ImportError:
         return False
 
-    try:
-        from api.profiles import get_active_hermes_home
-        hermes_home = Path(get_active_hermes_home()).expanduser().resolve()
-    except Exception:
-        hermes_home = Path(os.getenv('HERMES_HOME', str(HOME / '.hermes'))).expanduser().resolve()
+    # Process any leftover cleanup manifests from a previous failed run.
+    # This runs before the DB-existence check so pending artifact
+    # removals get another chance even when the current session ID
+    # is unrelated.
+    stale_cleanup_complete = _process_stale_cleanup_manifests(hermes_home)
+
     db_path = hermes_home / 'state.db'
     if not db_path.exists():
         return False
 
     try:
         with closing(sqlite3.connect(str(db_path))) as conn:
-            cur = conn.cursor()
-            cur.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
-            cur.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+            conn.row_factory = sqlite3.Row
+            # SQLite does not enforce foreign keys by default; enabling
+            # PRAGMA foreign_keys makes the ON DELETE CASCADE clauses on
+            # session_model_usage and telegram_dm_topic_bindings fire
+            # automatically.  Compression locks have no FK, so they are
+            # cleaned explicitly below.
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("BEGIN IMMEDIATE")
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+            if not {"id", "parent_session_id"}.issubset(columns):
+                return False
+
+            selected = ["id", "parent_session_id"]
+            for column in (
+                "model_config", "source", "end_reason", "started_at", "ended_at"
+            ):
+                selected.append(column if column in columns else f"NULL AS {column}")
+            rows = conn.execute(f"SELECT {', '.join(selected)} FROM sessions").fetchall()
+
+            # _delegate_from is authoritative. source=subagent is the legacy
+            # compatibility signal for rows created before that marker existed,
+            # but legacy branch/compression continuations must remain intact.
+            records = []
+            for row in rows:
+                model_config = {}
+                raw_model_config = row["model_config"]
+                model_config_known = raw_model_config in (None, "")
+                if not model_config_known:
+                    try:
+                        parsed_model_config = json.loads(raw_model_config)
+                    except (TypeError, ValueError):
+                        parsed_model_config = None
+                    if isinstance(parsed_model_config, dict):
+                        model_config = parsed_model_config
+                        model_config_known = True
+                records.append(
+                    {
+                        "id": row["id"],
+                        "parent_id": row["parent_session_id"],
+                        "delegate_from": model_config.get("_delegate_from"),
+                        "branched_from": model_config.get("_branched_from"),
+                        "model_config_known": model_config_known,
+                        "source": row["source"],
+                        "end_reason": row["end_reason"],
+                        "started_at": row["started_at"],
+                        "ended_at": row["ended_at"],
+                    }
+                )
+            records_by_id = {record["id"]: record for record in records}
+
+            def _timestamp_value(value):
+                """Return a comparable UTC timestamp, or None when ambiguous."""
+                if isinstance(value, bool) or value in (None, ""):
+                    return None
+                if isinstance(value, (int, float)):
+                    numeric = float(value)
+                    return numeric if math.isfinite(numeric) else None
+                if isinstance(value, datetime.datetime):
+                    parsed = value
+                elif isinstance(value, str):
+                    raw = value.strip()
+                    if not raw:
+                        return None
+                    try:
+                        numeric = float(raw)
+                        return numeric if math.isfinite(numeric) else None
+                    except ValueError:
+                        try:
+                            parsed = datetime.datetime.fromisoformat(
+                                raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+                            )
+                        except ValueError:
+                            return None
+                else:
+                    return None
+                if parsed.tzinfo is None:
+                    return None
+                try:
+                    numeric = parsed.timestamp()
+                except (OverflowError, OSError, ValueError):
+                    return None
+                return numeric if math.isfinite(numeric) else None
+
+            def _must_preserve(record, parent):
+                """Fail closed when branch/compression evidence is ambiguous."""
+                if record["branched_from"] is not None:
+                    return True
+                end_reason = parent.get("end_reason")
+                if end_reason == "compression":
+                    return True
+                if end_reason != "branched":
+                    return False
+                started_at = _timestamp_value(record["started_at"])
+                parent_ended_at = _timestamp_value(parent.get("ended_at"))
+                if started_at is None or parent_ended_at is None:
+                    return True
+                return started_at >= parent_ended_at
+
+            def _lineage_parent(record):
+                """Return the parent that supplies this row's lineage edge.
+
+                ``_delegate_from`` is authoritative when present. Falling back
+                to the physical parent is only valid for legacy rows without
+                that marker; otherwise a compression continuation whose physical
+                parent differs from its lineage parent could be deleted.
+                """
+                delegate_from = record["delegate_from"]
+                if delegate_from is not None:
+                    return records_by_id.get(delegate_from) or {}
+                return records_by_id.get(record["parent_id"]) or {}
+
+            # Once a branch/compression continuation is preserved, its physical
+            # child tree is outside the delete lineage. Stale inherited delegate
+            # markers must not let traversal re-enter that retained subtree.
+            preserved_ids = {
+                record["id"]
+                for record in records
+                if record["id"] != sid
+                and _must_preserve(record, _lineage_parent(record))
+            }
+            while True:
+                descendants = {
+                    record["id"]
+                    for record in records
+                    if record["id"] != sid
+                    and record["parent_id"] in preserved_ids
+                }
+                new_ids = descendants - preserved_ids
+                if not new_ids:
+                    break
+                preserved_ids.update(new_ids)
+
+            found = {sid}
+            frontier = {sid}
+            while frontier:
+                next_frontier = set()
+                for record in records:
+                    row_id = record["id"]
+                    if row_id in found or row_id in preserved_ids:
+                        continue
+                    parent_id = record["parent_id"]
+                    delegate_from = record["delegate_from"]
+                    linked_to_frontier = (
+                        delegate_from in frontier or parent_id in frontier
+                    )
+                    if not linked_to_frontier:
+                        continue
+                    parent = _lineage_parent(record)
+                    if _must_preserve(record, parent):
+                        continue
+                    # Explicit _delegate_from is authoritative even when a
+                    # migrated legacy row lacks source='subagent'. Branch and
+                    # compression evidence above still wins and preserves it.
+                    if delegate_from is not None:
+                        if delegate_from in frontier:
+                            next_frontier.add(row_id)
+                        continue
+                    # Only marker-less legacy inference requires the historical
+                    # source tag plus a compatible physical-parent edge.
+                    if record["source"] != "subagent":
+                        continue
+                    if (
+                        parent_id in frontier
+                        and record["model_config_known"]
+                    ):
+                        next_frontier.add(row_id)
+
+                found.update(next_frontier)
+                frontier = next_frontier
+
+            delegate_ids = sorted(found - {sid})
+            all_removed_ids = [sid, *delegate_ids]
+            placeholders = ",".join("?" * len(all_removed_ids))
+
+            # Delete delegate children first (messages, then orphan their
+            # children, then the rows themselves).
+            for child_id in delegate_ids:
+                conn.execute("DELETE FROM messages WHERE session_id = ?", (child_id,))
+            for child_id in delegate_ids:
+                conn.execute(
+                    "UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?",
+                    (child_id,),
+                )
+            for child_id in delegate_ids:
+                conn.execute("DELETE FROM sessions WHERE id = ?", (child_id,))
+
+            # Preserve every remaining child as an independent row, matching
+            # current SessionDB.delete_session().
+            conn.execute(
+                "UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?",
+                (sid,),
+            )
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+            conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+
+            # Referential-integrity cleanup for session-owned rows that are
+            # not covered by ON DELETE CASCADE.  session_model_usage and
+            # telegram_dm_topic_bindings have FK CASCADE (enforced by
+            # PRAGMA foreign_keys = ON above), but compression_locks has no
+            # foreign key, so stale rows would survive.  Gate each table
+            # on existence so this works on older schemas too.
+            table_names = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            if "compression_locks" in table_names:
+                conn.execute(
+                    f"DELETE FROM compression_locks WHERE session_id IN ({placeholders})",
+                    all_removed_ids,
+                )
+            # Belt-and-suspenders: also explicitly clear FK tables in case
+            # PRAGMA foreign_keys is OFF on an older SQLite build or a
+            # future schema drops the CASCADE clause.
+            if "session_model_usage" in table_names:
+                conn.execute(
+                    f"DELETE FROM session_model_usage WHERE session_id IN ({placeholders})",
+                    all_removed_ids,
+                )
+            if "telegram_dm_topic_bindings" in table_names:
+                conn.execute(
+                    f"DELETE FROM telegram_dm_topic_bindings WHERE session_id IN ({placeholders})",
+                    all_removed_ids,
+                )
+
+            # Persist a cleanup manifest BEFORE the commit so artifact
+            # removal is idempotent and retryable.  Each call uses a unique
+            # manifest filename (atomic temp-file + rename) so concurrent
+            # deletes never clobber each other's retry records.
+            sessions_dir = hermes_home / "sessions"
+            sessions_dir.mkdir(parents=True, exist_ok=True)
+            manifest_basename = f".cleanup_manifest_{uuid.uuid4().hex}"
+            manifest_path = sessions_dir / f"{manifest_basename}.json"
+            manifest_tmp = sessions_dir / f"{manifest_basename}.tmp"
+            try:
+                manifest_tmp.write_text(
+                    json.dumps(sorted(str(i) for i in all_removed_ids)),
+                    encoding="utf-8",
+                )
+                manifest_tmp.rename(manifest_path)
+            except OSError:
+                logger.warning("Failed to write cleanup manifest", exc_info=True)
+                try:
+                    manifest_tmp.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning(
+                        "Failed to remove incomplete cleanup manifest %s",
+                        manifest_tmp,
+                        exc_info=True,
+                    )
+                # Publishing the retry record is a prerequisite for making the
+                # DB deletion durable. Without it, committed rows could vanish
+                # while transcript artifacts remain forever and the UI reports
+                # a false success.
+                conn.rollback()
+                return False
+
             conn.commit()
-            return cur.rowcount > 0
+
+            # Post-commit artifact cleanup.  Scan ALL outstanding manifests
+            # (including the one just written) and retry every pending ID.
+            # Each manifest entry is re-checked against the DB so a stale
+            # manifest from a failed commit never unlinks a live session's
+            # artifacts.
+            artifact_cleanup_failed = False
+
+            def _is_session_alive(conn, sid):
+                """True when *sid* still has a row in the sessions table.
+                On any query failure, assume alive (fail closed) — an
+                uncertain liveness check must never trigger artifact
+                deletion on this unrecoverable state.db path.
+                """
+                try:
+                    cursor = conn.execute(
+                        "SELECT 1 FROM sessions WHERE id = ?", (sid,)
+                    )
+                    return cursor.fetchone() is not None
+                except Exception:
+                    return True
+
+            def _clean_artifacts_for_id(sessions_dir, removed_id):
+                """Remove on-disk transcript files for one session ID.
+                Returns True when every artifact is gone (or was absent).
+                """
+                if not is_safe_session_id(removed_id):
+                    return False
+                ok = True
+                for suffix in (".json", ".jsonl"):
+                    artifact = sessions_dir / f"{removed_id}{suffix}"
+                    if not artifact.exists():
+                        continue
+                    try:
+                        artifact.unlink(missing_ok=True)
+                    except OSError:
+                        ok = False
+                        logger.warning(
+                            "Failed to remove session artifact %s%s",
+                            removed_id,
+                            suffix,
+                            exc_info=True,
+                        )
+                try:
+                    for path in list(
+                        sessions_dir.glob(f"request_dump_{removed_id}_*.json")
+                    ):
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError:
+                            ok = False
+                            logger.warning(
+                                "Failed to remove request dump %s",
+                                path,
+                                exc_info=True,
+                            )
+                except OSError:
+                    ok = False
+                    logger.warning(
+                        "Failed to enumerate request dumps for %s",
+                        removed_id,
+                        exc_info=True,
+                    )
+                return ok
+
+            for mp in sorted(sessions_dir.glob(".cleanup_manifest_*.json")):
+                try:
+                    raw = mp.read_text(encoding="utf-8")
+                    pending_ids = json.loads(raw)
+                except (OSError, ValueError, TypeError):
+                    # The IDs are unknown, so deleting the manifest would lose
+                    # the only retry record for potentially orphaned artifacts.
+                    artifact_cleanup_failed = True
+                    continue
+                if not isinstance(pending_ids, list) or not all(
+                    isinstance(item, str) for item in pending_ids
+                ):
+                    artifact_cleanup_failed = True
+                    continue
+                still_pending = []
+                for removed_id in pending_ids:
+                    # Transaction-outcome guard: never unlink artifacts for
+                    # a session that still exists in the DB.  A stale
+                    # manifest from a failed commit must not delete data
+                    # belonging to a live conversation.
+                    if _is_session_alive(conn, removed_id):
+                        still_pending.append(removed_id)
+                        continue
+                    if not _clean_artifacts_for_id(sessions_dir, removed_id):
+                        still_pending.append(removed_id)
+                if still_pending:
+                    # Atomic rewrite using temp-file + rename.
+                    tmp = mp.with_suffix(".tmp")
+                    try:
+                        tmp.write_text(json.dumps(still_pending), encoding="utf-8")
+                        tmp.rename(mp)
+                    except OSError:
+                        logger.warning(
+                            "Failed to rewrite manifest %s", mp, exc_info=True,
+                        )
+                    artifact_cleanup_failed = True
+                else:
+                    mp.unlink(missing_ok=True)
+
+            return stale_cleanup_complete and not artifact_cleanup_failed
     except Exception:
+        logger.warning("Failed to delete CLI session %s from state.db", sid, exc_info=True)
         return False
+
+# ---------------------------------------------------------------------------
+# ``delete_cli_session`` nests each profile's cross-process file lock inside
+# that profile's in-process lock so stale-manifest read, DB transaction, and
+# post-commit cleanup remain one critical section without blocking unrelated
+# profiles.
+# ---------------------------------------------------------------------------
+def _process_stale_cleanup_manifests(hermes_home) -> bool:
+    """Process any leftover cleanup manifests outside a DB transaction.
+
+    Called at the start of each delete_cli_session run, before the
+    regular transaction, so a previous run whose DB commit succeeded
+    but artifact cleanup failed gets another chance — even when the
+    session ID being deleted this time is unrelated.
+
+    Serialized by the caller's per-profile thread and process locks so that the
+    manifest read → DB transaction → post-commit cleanup triad is
+    never interleaved across concurrent delete calls. Returns ``True`` only
+    when every discovered retry record was processed completely.
+    """
+    try:
+        import sqlite3
+    except ImportError:
+        return False
+    db_path = hermes_home / "state.db"
+    sessions_dir = hermes_home / "sessions"
+    if not sessions_dir.exists():
+        return True
+    manifests = sorted(sessions_dir.glob(".cleanup_manifest_*.json"))
+    if not manifests:
+        return True
+    # Missing state.db is not proof that a manifested session is dead. It may
+    # have been temporarily renamed, unmounted, or made inaccessible. Preserve
+    # every manifest and artifact until a successful query proves absence.
+    if not db_path.exists():
+        return False
+    cleanup_complete = True
+    for mp in manifests:
+        try:
+            raw = mp.read_text(encoding="utf-8")
+            pending_ids = json.loads(raw)
+        except (OSError, ValueError, TypeError):
+            # Preserve malformed/unreadable retry records. Their pending IDs
+            # are unknowable, so silently deleting them would turn an
+            # incomplete cleanup into a false success.
+            cleanup_complete = False
+            continue
+        if not isinstance(pending_ids, list) or not all(
+            isinstance(item, str) for item in pending_ids
+        ):
+            cleanup_complete = False
+            continue
+        pending_ids = list(pending_ids)
+        if not pending_ids:
+            mp.unlink(missing_ok=True)
+            continue
+        # Require a successful read-only query to prove absence. Opening via a
+        # read-only URI also prevents SQLite from creating a fresh empty DB if
+        # state.db disappears between the existence check and connect().
+        try:
+            db_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+            with closing(sqlite3.connect(db_uri, uri=True)) as conn:
+                cursor = conn.execute(
+                    "SELECT id FROM sessions WHERE id IN ({})".format(
+                        ",".join("?" * len(pending_ids))
+                    ),
+                    pending_ids,
+                )
+                alive = {row[0] for row in cursor.fetchall()}
+        except Exception:
+            # Liveness query failed (missing DB, lock, timeout, I/O error).
+            # Fail closed: preserve the manifest file on disk and skip it this
+            # round. A later call can retry when DB state is queryable.
+            cleanup_complete = False
+            continue
+
+        still_pending = []
+        for removed_id in pending_ids:
+            if removed_id in alive:
+                # Session still exists — the previous commit never
+                # reached the DB, so this manifest entry is stale.
+                # Drop it silently: never propagate a stale manifest
+                # into the post-commit cleanup loop where it would
+                # cause the current call to report a false failure.
+                continue
+            if not _clean_pending_artifact(sessions_dir, removed_id):
+                still_pending.append(removed_id)
+        if still_pending:
+            tmp = mp.with_suffix(".tmp")
+            try:
+                tmp.write_text(json.dumps(still_pending), encoding="utf-8")
+                tmp.rename(mp)
+            except OSError:
+                cleanup_complete = False
+        else:
+            try:
+                mp.unlink(missing_ok=True)
+            except OSError:
+                cleanup_complete = False
+    return cleanup_complete
+
+
+def _clean_pending_artifact(sessions_dir, removed_id):
+    """Remove on-disk transcript files for one session ID, outside a
+    DB transaction.  Returns True when every artifact is gone (or absent).
+    """
+    if not is_safe_session_id(removed_id):
+        return False
+    ok = True
+    for suffix in (".json", ".jsonl"):
+        artifact = sessions_dir / f"{removed_id}{suffix}"
+        if not artifact.exists():
+            continue
+        try:
+            artifact.unlink(missing_ok=True)
+        except OSError:
+            ok = False
+    try:
+        for path in list(sessions_dir.glob(f"request_dump_{removed_id}_*.json")):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                ok = False
+    except OSError:
+        ok = False
+    return ok
