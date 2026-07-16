@@ -298,7 +298,18 @@ def _blocker_details(conn, tasks):
                 getattr(action, "expires_at", None) if action is not None else None
             ),
             "actions": {
-                "plain_unblock": {"allowed": not sticky},
+                # For a typed non-exact attention the release goes through the
+                # Core's CAS seam; the cockpit echoes this pair back on
+                # /unblock so the operator resolves the projection they saw.
+                "plain_unblock": {
+                    "allowed": not sticky,
+                    "attention_id": (
+                        getattr(attention, "id", None) if not sticky else None
+                    ),
+                    "attention_version": (
+                        getattr(attention, "version", None) if not sticky else None
+                    ),
+                },
                 "approve_exact_action": {
                     "available": bool(
                         sticky and not action_approved
@@ -1039,7 +1050,19 @@ def _task_action_payload(task_id: str, body: dict, action: str, *, board=None):
                     "approve that exact action first"
                 )
             note = str(body.get("reason") or "").strip()
-            ok = _unblock_gate_aware(conn, task_id, current, note)
+            att_id = body.get("attention_id")
+            att_ver = body.get("attention_version")
+            try:
+                att_id = int(att_id) if att_id is not None else None
+                att_ver = int(att_ver) if att_ver is not None else None
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "attention_id and attention_version must be integers"
+                ) from exc
+            ok = _unblock_gate_aware(
+                conn, task_id, current, note,
+                attention_id=att_id, attention_version=att_ver,
+            )
         else:
             raise ValueError(f"invalid action: {action}")
         if not ok:
@@ -1373,7 +1396,10 @@ def _mint_gate_token_for_operator(conn, task_id: str, *, action: str, note: str)
     return token
 
 
-def _unblock_gate_aware(conn, task_id: str, task, note: str = "") -> bool:
+def _unblock_gate_aware(
+    conn, task_id: str, task, note: str = "", *,
+    attention_id=None, attention_version=None,
+) -> bool:
     """Unblock a task from the WebUI, transparently clearing a Human-Gate.
 
     The authenticated WebUI operator IS the human the gate exists for, so a
@@ -1381,12 +1407,80 @@ def _unblock_gate_aware(conn, task_id: str, task, note: str = "") -> bool:
     in the same step (parity with the Telegram gate button; the plaintext token
     never leaves this function). Ungated cards take the plain unblock path.
     Every release is recorded as a comment for the board audit trail.
+
+    Typed non-exact attentions (2026-07-16): the Core's legacy ``unblock_task``
+    fail-closes on ANY ``task_attentions`` row ("legacy unblock owns only
+    ordinary blocked cards"), so a card the circuit breaker parked with a typed
+    projection (decision/gave_up/protocol/...) was unreleasable from the
+    cockpit — /unblock returned "refused", surfaced as a bogus "status
+    changed, refresh" toast that no refresh could fix. Those cards go through
+    ``transition_task_status_with_attention``, the Core's only safe generic
+    blocked exit, exactly like the agent dashboard (plugin_api.update_task).
+    The CAS pair comes from the cockpit's snapshot when provided (the operator
+    releases what they SAW); older cockpit builds fall back to the live
+    projection. Exact-action attentions never reach this function —
+    ``_task_action_payload`` refuses sticky cards first.
     """
     kb = _kb()
     if not hasattr(kb, "unblock_task"):
         _patch_task(conn, task_id, {"status": "ready"})
         return True
     gated = bool(getattr(task, "human_gate", 0))
+    attention = None
+    if callable(getattr(kb, "get_current_attention", None)) and callable(
+        getattr(kb, "transition_task_status_with_attention", None)
+    ):
+        try:
+            attention = kb.get_current_attention(conn, task_id)
+        except Exception:
+            attention = None
+    if attention is not None and getattr(attention, "action_id", None) is None:
+        expected_id = int(attention_id if attention_id is not None else attention.id)
+        expected_version = int(
+            attention_version if attention_version is not None else attention.version
+        )
+        token = None
+        if gated:
+            # transition_* enforces the gate under action="change_status", not
+            # "unblock" — a mismatched action is a hard token rejection.
+            token = kb.issue_gate_token(conn, task_id, action="change_status")
+        result = kb.transition_task_status_with_attention(
+            conn, task_id=task_id, status="ready", actor="webui",
+            expected_attention_id=expected_id,
+            expected_attention_version=expected_version,
+            **({"token": token} if token else {}),
+        )
+        if result:
+            try:
+                kb.add_comment(
+                    conn, task_id, "webui",
+                    (
+                        "GATE-FREIGABE via WebUI-Cockpit (Token einmalig erzeugt "
+                        "und sofort eingelöst durch den eingeloggten Operator)"
+                        if gated and token
+                        else "UNBLOCK via WebUI-Cockpit"
+                    )
+                    + f" — typed attention #{expected_id} v{expected_version} aufgelöst"
+                    + (f": {note}" if note else ""),
+                )
+            except Exception:
+                pass
+            return True
+        outcome = getattr(result, "status", "conflict")
+        if outcome == "not_found":
+            raise LookupError("task not found")
+        if outcome == "gone":
+            raise RuntimeError(
+                "unblock conflict: the blocking attention expired or was "
+                "already resolved; refresh"
+            )
+        if outcome == "gate_refused":
+            raise RuntimeError(
+                "human-gate refused the release; the gate must be satisfied first"
+            )
+        raise RuntimeError(
+            "unblock conflict: the card or its attention changed; refresh and retry"
+        )
     if gated:
         token = kb.issue_gate_token(conn, task_id, action="unblock")
         if not token:
