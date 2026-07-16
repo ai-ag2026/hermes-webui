@@ -2365,6 +2365,25 @@ def _build_session_list_cache_payload(
             show_cron_sessions=show_cron_sessions,
             show_webhook_sessions=show_webhook_sessions,
         )
+    elif show_cli_sessions:
+        # sidebar_source == "webui": skip the external get_cli_sessions()
+        # bridge (22c4352e's perf win — that projection is the expensive
+        # part on large state.db / Claude-Code stores), but do NOT strip
+        # locally-sourced CLI-tagged rows out of webui_sessions. Those rows
+        # already came from all_sessions() above at zero extra cost, and
+        # _filter_sidebar_source() below still excludes them from the
+        # returned "sessions" list — dropping them here only zeroed out
+        # cli_session_count/archived_cli_count for the sidebar tab badges
+        # while sidebar_source=webui (#4766 regression: this branch used to
+        # run only for show_cli_sessions=False, where zero CLI counts are
+        # correct; the sidebar_source=="webui" shortcut hijacked the same
+        # branch and zeroed counts for the wrong reason).
+        diag_stage("filter_webui_sessions")
+        webui_sessions = _prune_orphaned_webui_zero_message_sessions(
+            webui_sessions,
+            diag_stage=diag_stage,
+        )
+        deduped_cli = []
     else:
         diag_stage("filter_webui_sessions")
         webui_sessions = [s for s in webui_sessions if not _is_cli_session_for_settings(s)]
