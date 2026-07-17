@@ -34,6 +34,11 @@ from contextlib import closing
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
+from api.agent_runtime import (
+    AgentRuntimeChangedError,
+    ensure_agent_runtime_current,
+    require_ai_agent_class,
+)
 from api.agent_sessions import (
     MESSAGING_SOURCES,
     _looks_like_default_cli_title,
@@ -8472,6 +8477,42 @@ def _message_window_for_display(messages, msg_limit=None, msg_before=None, expan
 
 
 _LIMITED_TOOL_CONTENT_MAX_CHARS = 4096
+# Defensive row backstop for the GET /api/session display path's state.db read.
+# This is NOT a semantic window (the display window counts visible rows
+# post-reconciliation via _message_window_for_display); it is a safety net so a
+# pathological/huge state.db cannot materialize unbounded rows into memory on the
+# display path. Legitimate sessions stay far below this; the compressed-session
+# case where _state_db_since_timestamp_for_limited_display bails (and would
+# otherwise full-scan) is the main beneficiary. Generous on purpose: no real
+# conversation approaches it, and the existing since_timestamp optimization
+# already handles the common tail-load case. The full-history model-context
+# callers (reconciliation, new-turn context) do NOT use this cap.
+_STATE_DB_DISPLAY_ROW_BACKSTOP = 50000
+
+
+def _state_db_backstop_limit_for_display(session, msg_before) -> int | None:
+    """Return the row backstop to apply to the display path's state.db read, or
+    ``None`` for an uncapped (full-history) read.
+
+    The backstop is a defensive net against a pathological/huge state.db, NOT a
+    semantic window. It is applied ONLY on provably-safe reads where no
+    ``truncation_boundary`` prefix is required for the merge:
+    ``merge_session_messages_append_only`` needs the rows at/around the session's
+    ``truncation_boundary`` to reconcile correctly, and a newest-N-only SQL cap
+    would drop those boundary rows for a >N-row session and corrupt the merge
+    (silently losing the preserved prefix). So this mirrors the same conditions
+    ``_state_db_since_timestamp_for_limited_display`` uses to decide a read is
+    boundary-free: not ``msg_before`` paging, and no ``truncation_watermark`` /
+    ``truncation_boundary``. Extracted for direct test coverage.
+    """
+    has_boundary_prefix = (
+        msg_before is not None
+        or getattr(session, "truncation_watermark", None) not in (None, "")
+        or getattr(session, "truncation_boundary", None) not in (None, "")
+    )
+    return None if has_boundary_prefix else _STATE_DB_DISPLAY_ROW_BACKSTOP
+
+
 _LIMITED_TOOL_CONTENT_NOTICE = (
     "\n\n[Tool output truncated in paginated session response; "
     "load the full transcript to inspect the complete result.]"
@@ -12462,6 +12503,14 @@ def handle_get(handler, parsed) -> bool:
                 _state_db_reader_kwargs = {"profile": _session_profile}
                 if state_db_since_timestamp is not None:
                     _state_db_reader_kwargs["since_timestamp"] = state_db_since_timestamp
+                # Apply the display-path row backstop ONLY on provably-safe
+                # reads where no truncation_boundary prefix is required for the
+                # merge — see _state_db_backstop_limit_for_display. Compressed
+                # sessions and msg_before paging need their full prefix rows for
+                # correct reconciliation, so those stay uncapped.
+                _backstop = _state_db_backstop_limit_for_display(s, msg_before)
+                if _backstop is not None:
+                    _state_db_reader_kwargs["limit"] = _backstop
                 state_db_messages = get_state_db_session_messages(
                     sid,
                     **_state_db_reader_kwargs,
@@ -16116,6 +16165,7 @@ def handle_post(handler, parsed) -> bool:
                     "api_key": _main_api_key,
                 }
 
+                ensure_agent_runtime_current()
                 try:
                     from agent.auxiliary_client import get_text_auxiliary_client
 
@@ -16136,7 +16186,7 @@ def handle_post(handler, parsed) -> bool:
                 except Exception as _e:
                     logger.debug("update summary auxiliary model failed; falling back to main model: %s", _e)
 
-                from run_agent import AIAgent
+                AIAgent = require_ai_agent_class()
 
                 agent = AIAgent(
                     model=_main_model,
@@ -20494,6 +20544,9 @@ def _handle_btw(handler, body):
         require(body, "question")
     except ValueError as e:
         return bad(handler, str(e))
+    stale_response = _agent_runtime_barrier_response(runner_local_owned=False)
+    if stale_response is not None:
+        return j(handler, stale_response, status=409)
     if _session_is_subagent_view_only(str(body.get("session_id") or "")):
         return bad(handler, "Subagent sessions are view-only and cannot be used for /btw from WebUI", 400)
     try:
@@ -20553,6 +20606,9 @@ def _handle_background(handler, body):
         require(body, "prompt")
     except ValueError as e:
         return bad(handler, str(e))
+    stale_response = _agent_runtime_barrier_response(runner_local_owned=False)
+    if stale_response is not None:
+        return j(handler, stale_response, status=409)
     try:
         s = get_session(body["session_id"])
     except KeyError:
@@ -20839,6 +20895,31 @@ def _active_run_stream_for_session(session_id: str | None) -> str | None:
     return None
 
 
+def _agent_runtime_barrier_response(
+    *,
+    runner_local_owned: bool = False,
+    external_runtime_owned: bool | None = None,
+) -> dict | None:
+    """Return the typed stale-runtime response for local in-process turns."""
+    if external_runtime_owned is True:
+        return None
+    if runner_local_owned and webui_gateway_chat_enabled(get_config()):
+        return None
+    from api.runtime_adapter import runtime_adapter_runner_enabled
+
+    if runner_local_owned and runtime_adapter_runner_enabled():
+        return None
+    try:
+        ensure_agent_runtime_current()
+    except AgentRuntimeChangedError as exc:
+        return {
+            "error": str(exc),
+            "type": "agent_runtime_stale",
+            "retryable": True,
+        }
+    return None
+
+
 def _start_chat_stream_for_session(
     s,
     *,
@@ -20852,8 +20933,18 @@ def _start_chat_stream_for_session(
     goal_related: bool = False,
     source: str = "webui",
     moa_config=None,
+    external_runtime_owned: bool | None = None,
 ):
     """Persist pending state, register an SSE channel, and start an agent turn."""
+    if external_runtime_owned is None:
+        external_runtime_owned = webui_gateway_chat_enabled(get_config())
+    backend_is_gateway = bool(external_runtime_owned)
+    stale_response = _agent_runtime_barrier_response(
+        external_runtime_owned=backend_is_gateway,
+    )
+    if stale_response is not None:
+        stale_response["_status"] = 409
+        return stale_response
     attachments = attachments or []
     # Prevent duplicate runs in the same session while a stream is still active.
     # This commonly happens after page refresh/reconnect races and can produce
@@ -20972,7 +21063,6 @@ def _start_chat_stream_for_session(
     if goal_related:
         STREAM_GOAL_RELATED[stream_id] = True
     diag.stage("worker_thread_start") if diag else None
-    backend_is_gateway = webui_gateway_chat_enabled(get_config())
     worker_target = _run_gateway_chat_streaming if backend_is_gateway else _run_agent_streaming
     worker_kwargs = {"model_provider": model_provider, "goal_related": goal_related}
     if moa_config and not backend_is_gateway:
@@ -21143,6 +21233,7 @@ def _start_run(
         diag=diag,
         source=source,
         moa_config=moa_config,
+        external_runtime_owned=webui_gateway_chat_enabled(get_config()),
     )
 
 
@@ -21236,6 +21327,10 @@ def start_session_turn(
     msg = str(message or "").strip()
     if not msg:
         return {"error": "message is required", "_status": 400}
+    stale_response = _agent_runtime_barrier_response(runner_local_owned=True)
+    if stale_response is not None:
+        stale_response["_status"] = 409
+        return stale_response
     turn_source = str(source or "process_wakeup").strip() or "process_wakeup"
     try:
         s = get_session(session_id)
@@ -21712,6 +21807,7 @@ def _handle_goal_command(handler, body):
             model_provider=model_provider,
             normalized_model=normalized_model,
             goal_related=True,
+            external_runtime_owned=webui_gateway_chat_enabled(get_config()),
         )
         status = int(stream_response.pop("_status", 200) or 200)
         payload.update(stream_response)
@@ -21730,6 +21826,12 @@ def _handle_chat_start(handler, body, diag=None):
             require(body, "session_id")
         except ValueError as e:
             return bad(handler, str(e))
+        # Reject a stale local Agent runtime before materialising, claiming, or
+        # mutating any session state. Gateway-backed turns run in the gateway's
+        # process and do not depend on this WebUI process's imported checkout.
+        stale_response = _agent_runtime_barrier_response(runner_local_owned=True)
+        if stale_response is not None:
+            return j(handler, stale_response, status=409)
         diag.stage("get_session") if diag else None
         try:
             s = _get_or_materialize_session(body["session_id"], refresh_cli_messages=True)
@@ -22025,6 +22127,9 @@ def _normalize_chat_attachments(raw_attachments):
 
 def _handle_chat_sync(handler, body):
     """Fallback synchronous chat endpoint (POST /api/chat). Not used by frontend."""
+    stale_response = _agent_runtime_barrier_response(runner_local_owned=False)
+    if stale_response is not None:
+        return j(handler, stale_response, status=409)
     if _session_is_subagent_view_only(str(body.get("session_id") or "")):
         return bad(handler, "Subagent sessions are view-only and cannot be written from WebUI", 400)
     s = get_session(body["session_id"])
@@ -22060,7 +22165,7 @@ def _handle_chat_sync(handler, body):
         os.environ["HERMES_EXEC_ASK"] = "1"
         os.environ["HERMES_SESSION_KEY"] = s.session_id
     try:
-        from run_agent import AIAgent
+        AIAgent = require_ai_agent_class()
 
         with CHAT_LOCK:
             from api.config import (
@@ -22691,6 +22796,7 @@ def _llm_git_commit_message(system_prompt: str, user_prompt: str, session=None) 
             "base_url": _main_base_url,
             "api_key": _main_api_key,
         }
+        ensure_agent_runtime_current()
         try:
             from agent.auxiliary_client import get_text_auxiliary_client
 
@@ -22707,7 +22813,7 @@ def _llm_git_commit_message(system_prompt: str, user_prompt: str, session=None) 
         except Exception as _e:
             logger.debug("git commit message auxiliary model failed; falling back to main model: %s", _e)
 
-        from run_agent import AIAgent
+        AIAgent = require_ai_agent_class()
 
         agent = AIAgent(
             model=_main_model,
@@ -22753,6 +22859,12 @@ def _handle_git_commit_message(handler, body):
         return bad(handler, str(e))
     except GitWorkspaceError as e:
         return _git_bad(handler, e)
+    except AgentRuntimeChangedError as e:
+        return j(handler, {
+            "error": str(e),
+            "type": "agent_runtime_stale",
+            "retryable": True,
+        }, status=409)
     except Exception as e:
         logger.exception("git commit message generation failed")
         return bad(handler, _sanitize_error(e), 500)
@@ -22784,6 +22896,12 @@ def _handle_git_commit_message_selected(handler, body):
         return bad(handler, str(e))
     except GitWorkspaceError as e:
         return _git_bad(handler, e)
+    except AgentRuntimeChangedError as e:
+        return j(handler, {
+            "error": str(e),
+            "type": "agent_runtime_stale",
+            "retryable": True,
+        }, status=409)
     except Exception as e:
         logger.exception("selected git commit message generation failed")
         return bad(handler, _sanitize_error(e), 500)
@@ -23808,6 +23926,10 @@ def _manual_compression_status_payload(job):
         payload["ok"] = False
         payload["error"] = job.get("error") or "Compression failed"
         payload["error_status"] = int(job.get("error_status") or 400)
+        if job.get("error_type"):
+            payload["type"] = job["error_type"]
+        if job.get("retryable") is not None:
+            payload["retryable"] = bool(job["retryable"])
     elif status == "cancelled":
         payload["ok"] = False
         payload["error"] = job.get("error") or "Compression cancelled"
@@ -23842,6 +23964,8 @@ def _run_manual_compression_job(sid, body):
                         "status": "error",
                         "error": str((payload or {}).get("error") or "Compression failed"),
                         "error_status": status,
+                        "error_type": (payload or {}).get("type"),
+                        "retryable": (payload or {}).get("retryable"),
                         "updated_at": now,
                     }
                 )
@@ -23851,6 +23975,21 @@ def _run_manual_compression_job(sid, body):
                         "status": "done",
                         "result": payload,
                         "updated_at": now,
+                    }
+                )
+    except AgentRuntimeChangedError as exc:
+        logger.warning("Manual compression worker found stale Agent runtime for session %s", sid)
+        with _MANUAL_COMPRESSION_JOBS_LOCK:
+            job = _MANUAL_COMPRESSION_JOBS.get(sid)
+            if job:
+                job.update(
+                    {
+                        "status": "error",
+                        "error": str(exc),
+                        "error_status": 409,
+                        "error_type": "agent_runtime_stale",
+                        "retryable": True,
+                        "updated_at": time.time(),
                     }
                 )
     except Exception as exc:
@@ -23889,6 +24028,34 @@ def _handle_session_compress_start(handler, body):
     if focus_topic:
         job_body["focus_topic"] = focus_topic
 
+    # Repeated start requests observe an existing running job and do not admit
+    # new Agent work, so preserve that idempotent read even if the checkout has
+    # since changed. Do not hold the job lock while running Git subprocesses.
+    now = time.time()
+    with _MANUAL_COMPRESSION_JOBS_LOCK:
+        _manual_compression_cleanup_locked(now)
+        existing = _MANUAL_COMPRESSION_JOBS.get(sid)
+        if existing:
+            existing_payload = _manual_compression_status_payload(existing)
+            if existing_payload.get("status") == "running":
+                return j(handler, existing_payload)
+
+    # Reject a stale local Agent runtime before creating the asynchronous job.
+    try:
+        ensure_agent_runtime_current()
+    except AgentRuntimeChangedError as exc:
+        return j(
+            handler,
+            {
+                "error": str(exc),
+                "type": "agent_runtime_stale",
+                "retryable": True,
+            },
+            status=409,
+        )
+
+    # Another start request may have admitted a job while the runtime check ran.
+    # Re-check under the lock so only one worker is created.
     now = time.time()
     with _MANUAL_COMPRESSION_JOBS_LOCK:
         _manual_compression_cleanup_locked(now)
@@ -24104,10 +24271,11 @@ def _handle_session_compress(handler, body):
                     focus_topic,
                 )
 
+        ensure_agent_runtime_current()
         import api.config as _cfg
         from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
         import hermes_cli.runtime_provider as _runtime_provider
-        import run_agent as _run_agent
+        AIAgent = require_ai_agent_class()
 
         resolved_model, resolved_provider, resolved_base_url = _cfg.resolve_model_provider(
             _cfg.model_with_provider_context(s.model, getattr(s, "model_provider", None))
@@ -24150,7 +24318,7 @@ def _handle_session_compress(handler, body):
         )
         approx_tokens = _estimate_messages_tokens_rough(original_messages)
 
-        agent = _run_agent.AIAgent(
+        agent = AIAgent(
             model=resolved_model,
             provider=resolved_provider,
             base_url=resolved_base_url,
@@ -24245,6 +24413,12 @@ def _handle_session_compress(handler, body):
                 "focus_topic": focus_topic,
             },
         )
+    except AgentRuntimeChangedError as e:
+        return j(handler, {
+            "error": str(e),
+            "type": "agent_runtime_stale",
+            "retryable": True,
+        }, status=409)
     except Exception as e:
         logger.warning("Manual session compression failed: %s", e)
         return bad(handler, f"Compression failed: {_sanitize_error(e)}")
@@ -24754,10 +24928,11 @@ def _handle_handoff_summary(handler, body):
 
         # Call LLM for summary.
     try:
+        ensure_agent_runtime_current()
         import api.config as _cfg
         from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
         import hermes_cli.runtime_provider as _runtime_provider
-        import run_agent as _run_agent
+        AIAgent = require_ai_agent_class()
 
         # Try to resolve model from an existing session, fall back to default.
         resolved_model = None
@@ -24813,7 +24988,7 @@ def _handle_handoff_summary(handler, body):
                 "fallback": True,
             })
 
-        agent = _run_agent.AIAgent(
+        agent = AIAgent(
             model=resolved_model,
             provider=resolved_provider,
             base_url=resolved_base_url,
@@ -24893,6 +25068,12 @@ def _handle_handoff_summary(handler, body):
             "rounds": rounds,
             "fallback": fallback,
         })
+    except AgentRuntimeChangedError as e:
+        return j(handler, {
+            "error": str(e),
+            "type": "agent_runtime_stale",
+            "retryable": True,
+        }, status=409)
     except Exception as e:
         logger.warning("Handoff summary generation failed: %s", e)
         summary_text = _fallback_handoff_summary(msgs)

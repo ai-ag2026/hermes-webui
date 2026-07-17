@@ -10,7 +10,9 @@ import logging
 import mimetypes
 import os
 import queue
+import random
 import re
+import sqlite3
 import shlex
 import sys
 import subprocess
@@ -564,10 +566,13 @@ def _prewarm_skill_tool_modules():
 
 
 # Lazy import to avoid circular deps -- hermes-agent is on sys.path via api/config.py
-try:
-    from run_agent import AIAgent
-except ImportError:
-    AIAgent = None
+from api.agent_runtime import ensure_agent_runtime_current, get_ai_agent_class
+
+
+# Eagerly attempt the import at startup, matching the pre-guard behavior. If
+# dependencies are not ready yet, _get_ai_agent() retries when a chat starts.
+AIAgent = get_ai_agent_class()
+
 
 def _get_ai_agent():
     """Return AIAgent class, retrying the import if the initial attempt failed.
@@ -575,15 +580,13 @@ def _get_ai_agent():
     auto_install_agent_deps() in server.py may install missing packages after
     this module is first imported (common in Docker with a volume-mounted agent).
     Re-attempting the import here picks up the newly installed packages without
-    requiring a server restart.
+    requiring a server restart. The shared runtime guard also refuses to reuse
+    cached Agent modules after the source checkout changes.
     """
     global AIAgent
+    ensure_agent_runtime_current()
     if AIAgent is None:
-        try:
-            from run_agent import AIAgent as _cls  # noqa: PLC0415
-            AIAgent = _cls
-        except ImportError:
-            pass
+        AIAgent = get_ai_agent_class()
     return AIAgent
 
 
@@ -6614,7 +6617,25 @@ def _build_session_db_for_stream(state_db_path):
     """
     try:
         from hermes_state import SessionDB
-        return SessionDB(db_path=state_db_path)
+        _attempts = 3
+        _last_error = None
+        for _attempt in range(_attempts):
+            try:
+                return SessionDB(db_path=state_db_path)
+            except sqlite3.OperationalError as _db_err:
+                _db_err_text = str(_db_err).lower()
+                if not (
+                    "locked" in _db_err_text or "busy" in _db_err_text
+                ):
+                    raise
+                _last_error = _db_err
+                if _attempt < _attempts - 1:
+                    print(
+                        f"[webui] WARNING: SessionDB init attempt {_attempt + 1}/{_attempts} failed, retrying: {_db_err}",
+                        flush=True,
+                    )
+                    time.sleep(0.05 * (2 ** _attempt) + random.uniform(0, 0.05))
+        raise _last_error or RuntimeError("SessionDB construction exhausted all attempts")
     except Exception as _db_err:
         print(f"[webui] WARNING: SessionDB init failed - session_search will be unavailable: {_db_err}", flush=True)
         return None
@@ -7578,6 +7599,7 @@ def _run_agent_streaming(
             logger.debug("register_process_session failed", exc_info=True)
         # first-time module initialisation (which can be slow) does not
         # block other concurrent sessions waiting on _ENV_LOCK (#2024).
+        ensure_agent_runtime_current()
         _prewarm_skill_tool_modules()
         _install_streaming_cronjob_profile_wrapper()
         # Still set process-level env as fallback for tools that bypass thread-local
