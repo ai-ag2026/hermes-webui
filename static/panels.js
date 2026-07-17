@@ -8846,6 +8846,7 @@ const _SETTINGS_SPEECH_STORAGE_KEYS={
   tts_voice:'hermes-tts-voice',
   tts_rate:'hermes-tts-rate',
   tts_pitch:'hermes-tts-pitch',
+  tts_split:'hermes-tts-split',
   voice_mode_button:'hermes-voice-mode-button',
   voice_continuous:'hermes-voice-continuous',
   voice_silence_ms:'hermes-voice-silence-ms',
@@ -8976,6 +8977,8 @@ function _speechPreferencesPayloadFromUi(){
   if(ttsRateSlider) _setOwnedSpeechPayload(payload,'tts_rate',parseFloat(ttsRateSlider.value));
   const ttsPitchSlider=$('settingsTtsPitch');
   if(ttsPitchSlider) _setOwnedSpeechPayload(payload,'tts_pitch',parseFloat(ttsPitchSlider.value));
+  const ttsSplitSelP=$('settingsTtsSplit');
+  if(ttsSplitSelP) _setOwnedSpeechPayload(payload,'tts_split',ttsSplitSelP.value||'punctuation');
   const voiceModeCb=$('settingsVoiceModeEnabled');
   if(voiceModeCb) _setOwnedSpeechPayload(payload,'voice_mode_button',voiceModeCb.checked);
   const rawAudioCb=$('settingsRawAudio');
@@ -9661,6 +9664,18 @@ async function loadSettingsPanel(){
         _schedulePreferencesAutosave();
       };
     }
+    // Response splitting for TTS playback (punctuation | paragraphs | none).
+    const ttsSplitSel=$('settingsTtsSplit');
+    if(ttsSplitSel){
+      const savedSplit=String(_speechSetting('tts_split','hermes-tts-split','punctuation')||'punctuation');
+      ttsSplitSel.value=(savedSplit==='paragraphs'||savedSplit==='none')?savedSplit:'punctuation';
+      _syncSpeechPreferenceCache('tts_split',ttsSplitSel.value);
+      ttsSplitSel.onchange=function(){
+        _markSpeechPreferenceChanged('tts_split');
+        localStorage.setItem('hermes-tts-split',this.value);
+        _schedulePreferencesAutosave();
+      };
+    }
     // Self-hosted STT/TTS endpoints (server-side config.yaml, via /api/voice/config).
     _wireVoiceEndpoints();
     function _wireVoiceEndpoints(){
@@ -9692,6 +9707,8 @@ async function loadSettingsPanel(){
           setVal('settingsSttLanguage',sec.language);
           setVal('settingsSttMimeTypes',sec.mime_types);
           setVal('settingsSttResponseFormat',sec.response_format);
+          const rf=g('settingsSttRequestFormat');
+          if(rf) rf.value=(sec.request_format==='json'||sec.request_format==='json_base64')?'json':'';
           const k=g('settingsSttApiKey'); if(k){k.value=''; k.placeholder=sec.api_key_set?'•••• (set — leave blank to keep)':'(none)';}
         } else {
           selectProvider(g('settingsTtsEndpointEngine'),String(sec.provider||''),['openai']);
@@ -9717,6 +9734,7 @@ async function loadSettingsPanel(){
           stt.base_url=val('settingsSttBaseUrl'); stt.model=val('settingsSttModel');
           stt.language=val('settingsSttLanguage'); stt.mime_types=val('settingsSttMimeTypes');
           stt.response_format=val('settingsSttResponseFormat');
+          stt.request_format=val('settingsSttRequestFormat');
           const sk=val('settingsSttApiKey'); if(sk) stt.api_key=sk;
           const te=val('settingsTtsEndpointEngine'); if(te) tts.provider=te;
           tts.base_url=val('settingsTtsBaseUrl'); tts.model=val('settingsTtsModel');
