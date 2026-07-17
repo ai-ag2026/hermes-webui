@@ -1821,6 +1821,10 @@ window._hermesTtsSynth=function(id, text, opts){
     // Voice-mode completion hook shared by the chunked players: resume
     // listening after the last chunk (or after a failure, with backoff).
     const _resumeAfterTts=function(err){
+      // A failed read-back must not be silent — before this toast, a TTS
+      // timeout/error just dropped voice mode back to listening with no
+      // explanation (the answer stays on screen either way).
+      if(err&&typeof showToast==='function') showToast(t('voice_tts_failed')||('Voice reply TTS failed: '+((err&&err.message)||err)),4000,'error');
       if(_voiceModeActive) setTimeout(function(){_startListening();}, err?1000:500);
     };
     // Extension-registered TTS engine (window.registerHermesTtsEngine): synth
