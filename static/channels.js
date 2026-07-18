@@ -8,9 +8,52 @@ let _channelsPairingData = null;
 let _channelsWebhooksData = null;
 let _channelsActiveTab = 'platforms';
 
+// ── Event delegation ──
+// Row/card actions (save platform, revoke pairing, toggle/delete webhook) all
+// carry values the WebUI does not control the character set of — pairing
+// user_id comes verbatim from the messaging platform adapter, and a webhook
+// name created via the CLI isn't constrained by the WebUI's own name regex.
+// Interpolating those into an inline onclick="...('${esc(value)}')" string is
+// NOT safe even with HTML-escaping: the browser HTML-decodes an attribute
+// value before compiling it as the inline handler's JS source, so an
+// HTML-escaped quote (&#39;) decodes right back to a real quote before the
+// JS parser ever sees it, letting a value like `x');alert(1);//` break out
+// of the string literal and inject a second statement. Values are instead
+// carried in data-* attributes (a single, non-code context — HTML-escaping
+// is fully sufficient there) and read via .dataset from a delegated
+// listener bound once per container, never re-parsed as source.
+function _bindChannelsDelegation(el, handlers) {
+  if (!el || el.dataset.channelsBound === '1') return;
+  el.dataset.channelsBound = '1';
+  Object.keys(handlers).forEach(evt => el.addEventListener(evt, handlers[evt]));
+}
+
+function _channelsPlatformsClick(e) {
+  const btn = e.target.closest('[data-channels-action="save-platform"]');
+  if (btn) saveChannelsPlatform(btn.dataset.platformId);
+}
+
+function _channelsPairingClick(e) {
+  const btn = e.target.closest('[data-channels-action="revoke-pairing"]');
+  if (btn) revokeChannelsPairing(btn.dataset.platform, btn.dataset.userId);
+}
+
+function _channelsWebhooksClick(e) {
+  const btn = e.target.closest('[data-channels-action="delete-webhook"]');
+  if (btn) deleteChannelsWebhook(btn.dataset.webhookName);
+}
+
+function _channelsWebhooksChange(e) {
+  const el = e.target;
+  if (el && el.matches && el.matches('[data-channels-action="toggle-webhook"]')) {
+    toggleChannelsWebhook(el.dataset.webhookName, el.checked);
+  }
+}
+
 async function loadChannelsPanel() {
   const el = $('channelsPlatformsContent');
   if (!el) return;
+  _bindChannelsDelegation(el, { click: _channelsPlatformsClick });
   el.innerHTML = `<div class="channels-empty">${esc(t('loading'))}</div>`;
   try {
     _channelsData = await api('/api/channels');
@@ -88,7 +131,7 @@ function _channelsPlatformCardHtml(platform, writable) {
         ${hint}
         ${fields}
         <div class="provider-card-row" style="margin-top:8px">
-          <button type="button" class="provider-card-btn provider-card-btn-primary" ${writable ? '' : 'disabled'} onclick="saveChannelsPlatform('${esc(platform.id)}')">${esc(t('channels_save'))}</button>
+          <button type="button" class="provider-card-btn provider-card-btn-primary" data-channels-action="save-platform" data-platform-id="${esc(platform.id)}" ${writable ? '' : 'disabled'}>${esc(t('channels_save'))}</button>
           ${docs}
         </div>
       </div>
@@ -136,6 +179,7 @@ async function saveChannelsPlatform(platformId) {
 async function loadChannelsPairing() {
   const el = $('channelsPairingContent');
   if (!el) return;
+  _bindChannelsDelegation(el, { click: _channelsPairingClick });
   el.innerHTML = `<div class="channels-empty">${esc(t('loading'))}</div>`;
   try {
     _channelsPairingData = await api('/api/channels/pairing');
@@ -174,7 +218,7 @@ function _renderChannelsPairing(data) {
           <div class="channels-row-title">${esc(a.platform)} — ${esc(a.user_name || a.user_id)}</div>
           <div class="channels-row-meta">${esc(a.user_id)}</div>
         </div>
-        <button type="button" class="provider-card-btn provider-card-btn-danger" ${writable ? '' : 'disabled'} onclick="revokeChannelsPairing('${esc(a.platform)}','${esc(a.user_id)}')">${esc(t('channels_revoke'))}</button>
+        <button type="button" class="provider-card-btn provider-card-btn-danger" data-channels-action="revoke-pairing" data-platform="${esc(a.platform)}" data-user-id="${esc(a.user_id)}" ${writable ? '' : 'disabled'}>${esc(t('channels_revoke'))}</button>
       </div>`).join('')
     : `<div class="channels-empty">${esc(t('channels_no_approved'))}</div>`;
 
@@ -254,6 +298,7 @@ async function clearChannelsPending() {
 async function loadChannelsWebhooksTab() {
   const el = $('channelsWebhooksContent');
   if (!el) return;
+  _bindChannelsDelegation(el, { click: _channelsWebhooksClick, change: _channelsWebhooksChange });
   el.innerHTML = `<div class="channels-empty">${esc(t('loading'))}</div>`;
   try {
     _channelsWebhooksData = await api('/api/channels/webhooks');
@@ -287,10 +332,10 @@ function _renderChannelsWebhooks(data) {
           <div class="channels-row-meta">${esc(s.url)} · ${esc((s.events || []).join(', ') || t('channels_all_events'))} · ${esc(t('channels_deliver_to'))}: ${esc(s.deliver)}</div>
         </div>
         <label class="plugin-toggle-switch has-tooltip" data-tooltip="${esc(t('channels_enabled'))}">
-          <input type="checkbox" ${s.enabled ? 'checked' : ''} ${writable ? '' : 'disabled'} onchange="toggleChannelsWebhook('${esc(s.name)}', this.checked)">
+          <input type="checkbox" data-channels-action="toggle-webhook" data-webhook-name="${esc(s.name)}" ${s.enabled ? 'checked' : ''} ${writable ? '' : 'disabled'}>
           <span class="plugin-toggle-slider"></span>
         </label>
-        <button type="button" class="provider-card-btn provider-card-btn-danger" ${writable ? '' : 'disabled'} onclick="deleteChannelsWebhook('${esc(s.name)}')">${esc(t('channels_delete'))}</button>
+        <button type="button" class="provider-card-btn provider-card-btn-danger" data-channels-action="delete-webhook" data-webhook-name="${esc(s.name)}" ${writable ? '' : 'disabled'}>${esc(t('channels_delete'))}</button>
       </div>`).join('')
     : `<div class="channels-empty">${esc(t('channels_no_webhooks'))}</div>`;
 

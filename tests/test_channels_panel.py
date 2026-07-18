@@ -9,6 +9,7 @@ running the tests.
 
 import io
 import json
+import re
 import sys
 import types
 from pathlib import Path
@@ -492,6 +493,28 @@ class TestWebhooks:
         channels.handle_channels_delete(handler, _parsed("/api/channels/webhooks/nope"))
         assert handler.status == 404
 
+    def test_enable_platform_gated_closed_403(self, fake_agent, gated):
+        handler = _Handler()
+        channels.handle_channels_post(handler, _parsed("/api/channels/webhooks/enable"), {})
+        assert handler.status == 403
+        assert fake_agent.webhook_enabled_flag is False
+
+    def test_enable_platform_without_agent_409(self, no_agent, writable):
+        handler = _Handler()
+        channels.handle_channels_post(handler, _parsed("/api/channels/webhooks/enable"), {})
+        assert handler.status == 409
+
+    def test_enable_platform_success(self, fake_agent, writable):
+        assert fake_agent.webhook_enabled_flag is False
+        handler = _Handler()
+        channels.handle_channels_post(handler, _parsed("/api/channels/webhooks/enable"), {})
+        assert handler.status == 200
+        body = _body(handler)
+        assert body["ok"] is True
+        assert body["enabled"] is True
+        assert body["restart_required"] is True
+        assert fake_agent.config_store["platforms"]["webhook"]["enabled"] is True
+
 
 # ── Frontend markers ─────────────────────────────────────────────────────
 
@@ -539,3 +562,98 @@ class TestFrontendWiring:
     def test_script_tag_registered(self):
         index_html = self._read("index.html")
         assert 'src="static/channels.js' in index_html
+
+
+# ── Inline-handler XSS regression (pairing user_id / webhook name) ───────
+#
+# Proven payload: a pairing user_id (attacker-controlled — it comes verbatim
+# from the messaging platform adapter via PairingStore.list_approved(), not
+# from anything the WebUI validates) or a CLI-created webhook name (not bound
+# by the WebUI's own name regex) of `x');alert(document.domain);//`.
+#
+# esc() HTML-escapes a quote to `&#39;`, which is sufficient to stay inside an
+# HTML attribute's own quoting — but NOT sufficient when that attribute is an
+# inline event handler (onclick=/onchange=): the browser HTML-decodes an
+# attribute value before compiling it as the handler's JS source, so the
+# escaped quote decodes right back to a real `'` before the JS parser ever
+# sees it, letting the payload close the string literal and inject a second
+# statement. An admin clicking "Revoke" in the Pairing tab (normal operation,
+# not an edge case) would then execute attacker-controlled JS in the WebUI's
+# own origin. The fix carries these values in data-* attributes (a single,
+# non-code context, where esc()'s HTML-escaping is fully sufficient) read via
+# .dataset from a delegated listener, never re-parsed as source.
+class TestChannelsNoInlineHandlerInjection:
+    def _read(self):
+        return (Path(__file__).resolve().parent.parent / "static" / "channels.js").read_text(encoding="utf-8")
+
+    def test_no_inline_handler_calls_actions_that_take_untrusted_identifiers(self):
+        js = self._read()
+        # None of these four actions may be invoked via an inline on*=
+        # attribute at all -- with or without arguments -- since that's
+        # exactly the vulnerable construction, regardless of how the
+        # argument is built.
+        forbidden = [
+            r'onclick\s*=\s*"[^"]*revokeChannelsPairing\(',
+            r'onchange\s*=\s*"[^"]*toggleChannelsWebhook\(',
+            r'onclick\s*=\s*"[^"]*deleteChannelsWebhook\(',
+            r'onclick\s*=\s*"[^"]*saveChannelsPlatform\(',
+        ]
+        for pattern in forbidden:
+            match = re.search(pattern, js)
+            assert not match, f"found forbidden inline handler matching {pattern!r}: {match.group(0) if match else ''}"
+
+    def test_vulnerable_actions_wired_through_data_attributes_and_delegation(self):
+        js = self._read()
+        # The value-carrying attributes are plain data-* (HTML-attribute
+        # context only -- esc() is the correct and sufficient escaping here,
+        # since .dataset reads the decoded string without ever treating it
+        # as source).
+        assert 'data-user-id="${esc(a.user_id)}"' in js
+        assert 'data-webhook-name="${esc(s.name)}"' in js
+        assert 'data-platform-id="${esc(platform.id)}"' in js
+        # Dispatched via a delegated addEventListener, not inline on*=.
+        assert "addEventListener" in js
+        for fn in (
+            "_channelsPlatformsClick",
+            "_channelsPairingClick",
+            "_channelsWebhooksClick",
+            "_channelsWebhooksChange",
+        ):
+            assert f"function {fn}(" in js, f"missing delegated handler {fn}"
+        for action in ("save-platform", "revoke-pairing", "toggle-webhook", "delete-webhook"):
+            assert f'data-channels-action="{action}"' in js, f"missing data-channels-action={action!r}"
+
+    def test_proven_payload_cannot_reach_an_inline_handler_body(self):
+        """Structural check with the exact payload from the report: render
+        the pairing-row template by hand (mirroring _renderChannelsPairing's
+        literal) with a malicious user_id, and confirm the payload only ever
+        appears inside a quoted data-* attribute -- never inside an on*=
+        attribute, escaped or not."""
+        payload = "x');alert(document.domain);//"
+        # Same escaping esc() applies (static/ui.js): & < > " ' -> entities.
+        escaped = (
+            payload.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+            .replace("'", "&#39;")
+        )
+        js = self._read()
+        row_template = re.search(
+            r'onclick="revokeChannelsPairing\(.*?\)">',
+            js,
+        )
+        # This exact vulnerable shape must no longer exist in the source at all.
+        assert row_template is None
+
+        # And: simulating the fixed template with the proven payload must
+        # place it only in the data-user-id attribute, never inside any
+        # on*= attribute value.
+        simulated_button = (
+            f'<button type="button" data-channels-action="revoke-pairing" '
+            f'data-platform="telegram" data-user-id="{escaped}" '
+            f">Revoke</button>"
+        )
+        on_attr_match = re.search(r'on\w+\s*=\s*"([^"]*)"', simulated_button)
+        assert on_attr_match is None, "payload rendering must not produce any on*= attribute"
+        assert f'data-user-id="{escaped}"' in simulated_button
