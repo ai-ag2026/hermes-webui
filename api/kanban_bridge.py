@@ -803,6 +803,39 @@ def _links_for(conn, task_id: str) -> dict:
     }
 
 
+def _task_artifacts(conn, task_id: str) -> list:
+    """Durable completion artifacts for a task, newest producer run first.
+
+    Rows come from the dispatcher's validated ``task_artifacts`` table; the
+    durable copies live under the Hermes home (kanban/artifacts/...), which
+    the /api/media allowlist already serves, so the frontend can render them
+    as inline media/download links without a new serving route.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT durable_path, original_path, content_type, size, producer_run_id "
+            "FROM task_artifacts WHERE task_id = ? "
+            "ORDER BY producer_run_id DESC, id ASC",
+            (task_id,),
+        ).fetchall()
+    except Exception:
+        # Older boards without the table (pre-migration) simply have none.
+        return []
+    artifacts = []
+    for row in rows:
+        original = str(row["original_path"] or "")
+        artifacts.append({
+            "path": str(row["durable_path"] or ""),
+            # Display name: the original basename is human-meaningful; the
+            # durable basename carries a content hash prefix.
+            "name": (original.rsplit("/", 1)[-1] or str(row["durable_path"] or "").rsplit("/", 1)[-1]),
+            "content_type": row["content_type"],
+            "size": row["size"],
+            "run_id": row["producer_run_id"],
+        })
+    return artifacts
+
+
 def _task_detail_payload(task_id: str, *, board=None):
     """Return the full task detail: task dict, comments, events, dependency links, and run history."""
     kb = _kb()
@@ -816,6 +849,7 @@ def _task_detail_payload(task_id: str, *, board=None):
             task_data["block_detail"] = detail
         return {
             "task": task_data,
+            "artifacts": _task_artifacts(conn, task_id),
             "comments": [_obj_dict(c) for c in kb.list_comments(conn, task_id)],
             "events": [_obj_dict(e) for e in kb.list_events(conn, task_id)],
             "links": _links_for(conn, task_id),

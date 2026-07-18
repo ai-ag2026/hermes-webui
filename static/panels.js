@@ -3751,6 +3751,24 @@ async function removeKanbanDependency(parentId, childId){
   } catch(e) { showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error'); }
 }
 
+function _kanbanArtifactHtml(a){
+  // Durable completion artifacts (kanban_complete(artifacts=[...])) rendered
+  // as real media instead of a path string: images inline (lightbox via the
+  // shared .msg-media-img handler), everything else a download link. The
+  // durable copies live under the Hermes home, which /api/media serves.
+  const path=String(a.path||'');
+  if(!path) return '';
+  const name=String(a.name||path.split('/').pop()||'artifact');
+  const ct=String(a.content_type||'');
+  const size=Number(a.size)>0?` <span class="kanban-artifact-size">(${Math.round(Number(a.size)/1024)} KB)</span>`:'';
+  const mediaUrl='api/media?path='+encodeURIComponent(path);
+  if(/^image\//i.test(ct)){
+    return `<div class="kanban-artifact-row"><img class="msg-media-img kanban-artifact-thumb" src="${esc(mediaUrl)}" alt="${esc(name)}" loading="lazy"><span class="kanban-artifact-name">${esc(name)}</span>${size}</div>`;
+  }
+  const inline=/^(application\/pdf|text\/html)$/i.test(ct)?'&inline=1':'';
+  return `<div class="kanban-artifact-row"><a class="msg-media-link" href="${esc(mediaUrl+inline)}" target="_blank" rel="noopener">📎 ${esc(name)}</a>${size}</div>`;
+}
+
 function _kanbanRenderTaskDetail(data){
   const task = data.task || {};
   const log = data.log || {};
@@ -3761,6 +3779,7 @@ function _kanbanRenderTaskDetail(data){
   const events = data.events || [];
   const links = data.links || {};
   const runs = data.runs || [];
+  const artifacts = data.artifacts || [];
   // Note: 'running' is intentionally absent — entering 'running' is the
   // dispatcher/claim_task path's responsibility, not a user UI write. The
   // bridge rejects PATCH status='running' with HTTP 400 to match the agent
@@ -3817,6 +3836,7 @@ function _kanbanRenderTaskDetail(data){
       ${_kanbanDetailSection('kanban-detail-events', String(t('kanban_events_count')).replace('{0}', events.length), events.map(_kanbanEventHtml).join(''), 'kanban_no_events')}
       ${_kanbanDetailSection('kanban-detail-links', t('kanban_links'), _kanbanLinksHtml(links), 'kanban_empty')}
       ${_kanbanDetailSection('kanban-detail-runs', String(t('kanban_runs_count')).replace('{0}', runs.length), runs.map(_kanbanRunHtml).join(''), 'kanban_no_runs')}
+      ${_kanbanDetailSection('kanban-detail-artifacts', String(t('kanban_artifacts_count')).replace('{0}', artifacts.length), artifacts.map(_kanbanArtifactHtml).join(''), 'kanban_no_artifacts')}
       ${_kanbanDetailSection('kanban-detail-log', t('kanban_worker_log'), log.content ? `<pre class="kanban-detail-pre">${esc(log.content)}</pre>` : '', 'kanban_empty')}
     </div>
     <div class="kanban-comment-form">

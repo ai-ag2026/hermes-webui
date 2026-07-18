@@ -7258,3 +7258,7 @@ html[data-conversation-outline="enabled"] #outlineToggleBtn:not([hidden]){displa
 /* Settings field highlight (mirrors msg-question-highlight / _highlightQuestionRow pattern) */
 .settings-field-highlight { animation: settings-field-pulse 1.6s ease-out; }
 @keyframes settings-field-pulse { 0% { box-shadow: 0 0 0 0 var(--focus-ring); } 35% { box-shadow: 0 0 0 4px var(--focus-ring); } 100% { box-shadow: 0 0 0 0 rgba(0, 0, 0, 0); } }
+.kanban-artifact-row{display:flex;align-items:center;gap:8px;padding:4px 0;font-size:13px;}
+.kanban-artifact-thumb{max-width:120px;max-height:80px;border-radius:4px;cursor:zoom-in;}
+.kanban-artifact-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.kanban-artifact-size{color:var(--muted);font-size:12px;}
