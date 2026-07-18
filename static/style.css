@@ -4880,8 +4880,9 @@ main.main > #mainKanban,
 main.main > #mainWorkspaces,
 main.main > #mainProfiles,
 main.main > #mainInsights,
+main.main > #mainChannels,
 main.main > #mainLogs{display:none;}
-main.main:not(.showing-settings):not(.showing-skills):not(.showing-memory):not(.showing-tasks):not(.showing-kanban):not(.showing-workspaces):not(.showing-profiles):not(.showing-insights):not(.showing-logs):not(.showing-plugin) > #mainChat{display:flex;}
+main.main:not(.showing-settings):not(.showing-skills):not(.showing-memory):not(.showing-tasks):not(.showing-kanban):not(.showing-workspaces):not(.showing-profiles):not(.showing-insights):not(.showing-channels):not(.showing-logs):not(.showing-plugin) > #mainChat{display:flex;}
 main.main.showing-settings > #mainSettings{display:flex;overflow-y:auto;}
 main.main.showing-skills > #mainSkills{display:flex;}
 main.main.showing-memory > #mainMemory{display:flex;}
@@ -4889,6 +4890,7 @@ main.main.showing-tasks > #mainTasks{display:flex;}
 main.main.showing-kanban > #mainKanban{display:flex;overflow-y:auto;}
 main.main.showing-workspaces > #mainWorkspaces{display:flex;}
 main.main.showing-profiles > #mainProfiles{display:flex;}
+main.main.showing-channels > #mainChannels{display:flex;overflow-y:auto;}
 main.main.showing-logs > #mainLogs{display:flex;}
 main.main.showing-plugin > #mainPlugin{display:flex;}
 main.main > #mainPlugin{display:none;}
@@ -5414,6 +5416,26 @@ main.main > #mainPlugin{display:none;}
    border colour on the card's own surface, which is always legible. */
 .plugin-open-btn{display:inline-flex;align-items:center;gap:6px;padding:6px 14px;background:transparent;color:var(--accent);border:1px solid var(--accent);border-radius:7px;font-size:13px;font-weight:600;cursor:pointer;text-decoration:none;}
 .plugin-open-btn:hover{background:var(--accent);color:var(--bg);}
+
+/* ── Channels panel (platforms / pairing / webhooks) ── */
+.channels-tab-bar{display:flex;gap:4px;margin:0 0 12px;border-bottom:1px solid var(--border);padding-bottom:0;}
+.channels-tab-btn{background:none;border:none;border-bottom:2px solid transparent;padding:6px 14px;font-size:13px;color:var(--muted);cursor:pointer;transition:color .15s,border-color .15s;margin-bottom:-1px;}
+.channels-tab-btn:hover{color:var(--text);}
+.channels-tab-active{color:var(--text);border-bottom-color:var(--accent,#7c3aed);font-weight:600;}
+.channels-gate-notice{display:flex;align-items:center;gap:8px;padding:10px 12px;margin-bottom:12px;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--muted);font-size:12px;line-height:1.4;}
+.channels-gate-notice code{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;background:var(--code-bg);padding:1px 5px;border-radius:4px;}
+.channels-section-title{font-size:12px;font-weight:600;color:var(--text);margin:16px 0 8px;}
+.channels-section-title:first-child{margin-top:0;}
+.channels-hint{font-size:11px;color:var(--muted);margin-bottom:10px;line-height:1.4;}
+.channels-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--sidebar);margin-bottom:8px;}
+.channels-row:last-child{margin-bottom:0;}
+.channels-row-info{flex:1;min-width:160px;display:flex;flex-direction:column;gap:2px;}
+.channels-row-title{font-size:12.5px;font-weight:500;color:var(--text);}
+.channels-row-meta{font-size:11px;color:var(--muted);}
+.channels-empty{font-size:12px;color:var(--muted);padding:10px 0;font-style:italic;}
+.channels-form-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px;}
+.channels-secret-reveal{border:1px dashed var(--border);border-radius:8px;padding:10px 12px;margin-bottom:12px;background:var(--surface);}
+.channels-secret-reveal code{display:block;word-break:break-all;font-size:11.5px;background:var(--code-bg);padding:6px 8px;border-radius:6px;margin:4px 0;}
 
 /* ── Extension diagnostics cards ── */
 .extensions-copy-diagnostics-btn{white-space:nowrap;}
