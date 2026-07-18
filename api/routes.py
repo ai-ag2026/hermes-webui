@@ -12057,6 +12057,13 @@ def handle_get(handler, parsed) -> bool:
         if result is False:
             return _kanban_unknown_endpoint(handler, parsed, "GET")
         return True
+    if parsed.path.startswith("/api/channels"):
+        from api.channels import handle_channels_get
+
+        result = handle_channels_get(handler, parsed)
+        if result is False:
+            return bad(handler, f"unknown Channels endpoint: GET {parsed.path}", status=404)
+        return True
     if parsed.path == "/api/wiki/status":
         return _handle_llm_wiki_status(handler, parsed)
     if parsed.path == "/api/wiki/browse":
@@ -13886,6 +13893,13 @@ def handle_post(handler, parsed) -> bool:
         result = handle_kanban_post(handler, parsed, body)
         if result is False:
             return _kanban_unknown_endpoint(handler, parsed, "POST")
+        return True
+    if parsed.path.startswith("/api/channels"):
+        from api.channels import handle_channels_post
+
+        result = handle_channels_post(handler, parsed, body)
+        if result is False:
+            return bad(handler, f"unknown Channels endpoint: POST {parsed.path}", status=404)
         return True
     if parsed.path == "/api/dashboard/config":
         from api import dashboard_probe
@@ -16389,6 +16403,13 @@ def handle_delete(handler, parsed) -> bool:
         if result is False:
             return _kanban_unknown_endpoint(handler, parsed, "DELETE")
         return True
+    if parsed.path.startswith("/api/channels"):
+        from api.channels import handle_channels_delete
+
+        result = handle_channels_delete(handler, parsed)
+        if result is False:
+            return bad(handler, f"unknown Channels endpoint: DELETE {parsed.path}", status=404)
+        return True
     return False
 
 
@@ -16410,6 +16431,13 @@ def handle_put(handler, parsed) -> bool:
     if parsed.path.startswith("/api/mcp/servers/"):
         name = parsed.path[len("/api/mcp/servers/"):]
         return _handle_mcp_server_update(handler, name, body)
+    if parsed.path.startswith("/api/channels"):
+        from api.channels import handle_channels_put
+
+        result = handle_channels_put(handler, parsed, body)
+        if result is False:
+            return bad(handler, f"unknown Channels endpoint: PUT {parsed.path}", status=404)
+        return True
     return False
 
 # ── GET route helpers ─────────────────────────────────────────────────────────
