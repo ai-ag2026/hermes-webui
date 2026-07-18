@@ -12239,6 +12239,11 @@ def handle_get(handler, parsed) -> bool:
         from api.config import get_auxiliary_models
         return j(handler, get_auxiliary_models())
 
+    # ── Mixture of Agents config (GET/PUT) ──
+    if parsed.path == "/api/model/moa":
+        from api.config import get_moa_config
+        return j(handler, get_moa_config())
+
     if parsed.path == "/api/dashboard/status":
         from api import dashboard_probe
 
@@ -16722,6 +16727,12 @@ def handle_put(handler, parsed) -> bool:
                 return j(handler, save_toolset_env(parts[0], env if isinstance(env, dict) else {}))
         except ToolsetConfigError as exc:
             return j(handler, {"error": str(exc), **exc.extra}, status=exc.status)
+    if parsed.path == "/api/model/moa":
+        from api.config import set_moa_config
+        try:
+            return j(handler, {"ok": True, **set_moa_config(body)})
+        except ValueError as exc:
+            return bad(handler, str(exc), status=400)
     return False
 
 # ── GET route helpers ─────────────────────────────────────────────────────────
