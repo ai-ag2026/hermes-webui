@@ -583,7 +583,13 @@ def test_skills_hub_frontend_wiring_present():
     assert "/api/skills/hub/search" in panels
     assert "/api/skills/hub/installed" in panels
     assert "/api/skills/hub/status" in panels
-    assert "function switchSkillsTab" in panels
+    # The Skills panel's tab bar (Skills/Toolsets/Hub) is unified on the
+    # feat/toolset-config-ui .workspace-panel-tab pattern (switchSkillsPanelTab),
+    # per the integration-branch merge decision — switchSkillsTab (this
+    # package's original standalone My-Skills/Hub subtab switcher) was folded
+    # into it rather than kept as a second, duplicate tab mechanism.
+    assert "function switchSkillsPanelTab" in panels
+    assert "switchSkillsTab" not in panels
     assert "function scanSkillsHubResult" in panels
     assert "function installSkillsHubResult" in panels
     assert "function updateSkillsHubSkill" in panels
@@ -609,6 +615,10 @@ def test_skills_hub_html_has_tab_and_views():
     from pathlib import Path
 
     html = (Path(__file__).resolve().parents[1] / "static" / "index.html").read_text(encoding="utf-8")
-    assert 'id="skillsHubView"' in html
-    assert 'id="skillsMineView"' in html
-    assert "switchSkillsTab('hub')" in html
+    # Unified tab bar (see test_skills_hub_frontend_wiring_present): the Hub
+    # view is the third .workspace-panel-tab, not a standalone subtab pair.
+    assert 'id="skillsPanelTabContentHub"' in html
+    assert 'id="skillsPanelTabHub"' in html
+    assert "switchSkillsPanelTab('hub')" in html
+    assert 'id="skillsHubInstalledList"' in html
+    assert 'id="skillsHubResultsList"' in html

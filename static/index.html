@@ -250,18 +250,24 @@
       <div class="panel-head">
         <span data-i18n="tab_skills">Skills</span>
         <div class="panel-head-actions">
-          <button class="panel-head-btn has-tooltip has-tooltip--bottom" onclick="openSkillCreate()" data-tooltip="New skill" data-i18n-title="new_skill" aria-label="New skill"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
+          <button class="panel-head-btn has-tooltip has-tooltip--bottom" id="btnNewSkill" onclick="openSkillCreate()" data-tooltip="New skill" data-i18n-title="new_skill" aria-label="New skill"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
         </div>
       </div>
-      <div class="skills-subtabs" role="tablist" style="display:flex;gap:6px;padding:8px 12px 0">
-        <button type="button" class="skills-subtab active" data-skills-tab="mine" onclick="switchSkillsTab('mine')" role="tab" aria-selected="true" data-i18n="skills_tab_mine" style="flex:1;padding:6px 10px;font-size:12px;font-weight:600;border-radius:6px;border:1px solid var(--border2);background:var(--accent);color:#fff;cursor:pointer">My Skills</button>
-        <button type="button" class="skills-subtab" data-skills-tab="hub" onclick="switchSkillsTab('hub')" role="tab" aria-selected="false" data-i18n="skills_tab_hub" style="flex:1;padding:6px 10px;font-size:12px;font-weight:600;border-radius:6px;border:1px solid var(--border2);background:transparent;color:var(--text);cursor:pointer">Hub</button>
+      <div class="workspace-panel-tabs" role="tablist" aria-label="Skills panel views" data-i18n-aria-label="skills_panel_views">
+        <button class="workspace-panel-tab active" id="skillsPanelTabSkills" type="button" onclick="switchSkillsPanelTab('skills')" role="tab" aria-selected="true" data-i18n="tab_skills">Skills</button>
+        <button class="workspace-panel-tab" id="skillsPanelTabToolsets" type="button" onclick="switchSkillsPanelTab('toolsets')" role="tab" aria-selected="false" data-i18n="toolsets_tab_title">Toolsets</button>
+        <button class="workspace-panel-tab" id="skillsPanelTabHub" type="button" onclick="switchSkillsPanelTab('hub')" role="tab" aria-selected="false" data-i18n="skills_tab_hub">Hub</button>
       </div>
-      <div id="skillsMineView">
+      <div id="skillsPanelTabContentSkills">
         <div class="skills-search sidebar-search"><svg class="sidebar-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg><input id="skillsSearch" type="search" placeholder="Search skills..." data-i18n-placeholder="search_skills" oninput="filterSkills()" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore="true" data-form-type="other"></div>
         <div class="skills-list" id="skillsList"><div style="padding:12px;color:var(--muted);font-size:12px" data-i18n="loading">Loading...</div></div>
       </div>
-      <div id="skillsHubView" style="display:none">
+      <div id="skillsPanelTabContentToolsets" hidden style="display:flex;flex-direction:column;min-height:0;flex:1">
+        <div style="font-size:11px;color:var(--muted);padding:8px 12px" data-i18n="toolsets_desc">Enable/disable toolsets and configure their provider, model, and API keys — the GUI counterpart of <code>hermes tools</code>.</div>
+        <div id="toolsetsDisabledNotice" style="display:none;font-size:11px;color:var(--muted);margin:0 12px 8px;padding:8px 10px;background:var(--code-bg);border:1px solid var(--border2);border-radius:6px"></div>
+        <div class="skills-list" id="toolsetsList" style="flex:1;overflow-y:auto"><div style="padding:12px;color:var(--muted);font-size:12px" data-i18n="loading">Loading...</div></div>
+      </div>
+      <div id="skillsPanelTabContentHub" hidden>
         <div class="skills-search sidebar-search"><svg class="sidebar-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg><input id="skillsHubSearch" type="search" placeholder="Search the skill hub..." data-i18n-placeholder="skills_hub_search_placeholder" onkeydown="if(event.key==='Enter'){event.preventDefault();searchSkillsHub();}" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore="true" data-form-type="other"><button type="button" class="panel-head-btn" style="margin-left:6px" onclick="searchSkillsHub()" aria-label="Search" data-i18n-aria-label="search"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg></button></div>
         <div id="skillsHubGateNotice" style="display:none;margin:0 12px 8px;padding:8px 10px;border-radius:8px;border:1px solid rgba(232,160,48,.3);background:rgba(232,160,48,.08);font-size:11px;color:var(--muted)"></div>
         <div id="skillsHubActionStatus" style="margin:0 12px 8px"></div>
