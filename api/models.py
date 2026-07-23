@@ -810,6 +810,28 @@ def _clear_webui_deleted_session_tombstone(sid: str) -> None:
             logger.debug("Failed to remove empty webui deleted-session tombstone", exc_info=True)
 
 
+def _content_has_reasoning_only_parts(content) -> bool:
+    if not isinstance(content, list) or not content:
+        return False
+    saw_reasoning = False
+    for part in content:
+        if not isinstance(part, dict):
+            if str(part or '').strip():
+                return False
+            continue
+        part_type = str(part.get('type') or '').lower()
+        if part_type in {'thinking', 'reasoning'}:
+            text = part.get('thinking') or part.get('reasoning') or part.get('text') or ''
+            if str(text).strip():
+                saw_reasoning = True
+            continue
+        if part_type == 'text' and str(part.get('text') or part.get('content') or '').strip():
+            return False
+        if part_type not in {'text', 'thinking', 'reasoning'}:
+            return False
+    return saw_reasoning
+
+
 def _active_stream_ids():
     with STREAMS_LOCK:
         active_ids = set(STREAMS.keys())
@@ -824,13 +846,30 @@ def _active_stream_ids():
     return active_ids
 
 
-def _append_recovered_turn_to_context(session, recovered: dict) -> None:
-    context_messages = getattr(session, 'context_messages', None)
-    if not isinstance(context_messages, list) or not context_messages:
-        return
+def _recovered_model_context_projection(message: dict) -> dict | None:
+    if not isinstance(message, dict):
+        return None
+    projected = dict(message)
+    projected.pop('reasoning', None)
+    if projected.get('_error'):
+        return None
+    if _content_has_reasoning_only_parts(projected.get('content')):
+        if projected.get('tool_calls'):
+            projected['content'] = ''
+        else:
+            return None
+    projected_text = _normalize_journal_recovery_text(projected.get('content'))
+    if not projected_text and not projected.get('tool_call_id') and not projected.get('tool_calls'):
+        return None
+    return projected
+
+
+def _append_recovered_context_projection(
+    session,
+    context_messages: list,
+    recovered: dict,
+) -> None:
     recovered_text = _normalize_journal_recovery_text(recovered.get('content'))
-    if not recovered_text and not recovered.get('tool_call_id') and not recovered.get('tool_calls'):
-        return
     if recovered_text:
         if recovered.get('role') == 'user':
             if _message_matches_pending_checkpoint(
@@ -850,7 +889,28 @@ def _append_recovered_turn_to_context(session, recovered: dict) -> None:
     context_messages.append(dict(recovered))
 
 
-def _append_recovered_pending_turn(session, *, timestamp: int | float | None = None) -> dict | None:
+def _seed_recovered_context_from_messages(session, context_messages: list) -> None:
+    for message in getattr(session, 'messages', None) or []:
+        projected = _recovered_model_context_projection(message)
+        if projected is None:
+            continue
+        context_messages.append(projected)
+
+
+def _append_recovered_turn_to_context(session, recovered: dict) -> None:
+    context_messages = getattr(session, 'context_messages', None)
+    if not isinstance(context_messages, list):
+        context_messages = []
+        session.context_messages = context_messages
+    if not context_messages:
+        _seed_recovered_context_from_messages(session, context_messages)
+    projected = _recovered_model_context_projection(recovered)
+    if projected is None:
+        return
+    _append_recovered_context_projection(session, context_messages, projected)
+
+
+def _append_recovered_pending_turn(session, *, timestamp: int | None = None) -> dict | None:
     pending_text = str(session.pending_user_message or '')
     if not pending_text:
         return None
@@ -2547,11 +2607,23 @@ def _collapse_adjacent_duplicate_partials(messages) -> tuple[list, bool]:
     return collapsed, changed
 
 
-def _find_existing_assistant_for_journal_content(session, content: str) -> int | None:
+def _find_existing_assistant_for_journal_content(
+    session,
+    content: str,
+    *,
+    max_index: int | None = None,
+    excluded_indexes: set[int] | None = None,
+) -> int | None:
     candidate = _normalize_journal_recovery_text(content)
     if not candidate:
         return None
-    for idx, message in enumerate(session.messages or []):
+    messages = session.messages or []
+    stop = len(messages) if max_index is None else min(len(messages), max_index)
+    substring_match = None
+    for idx in range(stop):
+        if excluded_indexes and idx in excluded_indexes:
+            continue
+        message = messages[idx]
         if not isinstance(message, dict) or message.get('role') != 'assistant':
             continue
         if message.get('_error'):
@@ -2561,9 +2633,9 @@ def _find_existing_assistant_for_journal_content(session, content: str) -> int |
             continue
         if existing == candidate:
             return idx
-        if len(candidate) >= 24 and candidate in existing:
-            return idx
-    return None
+        if substring_match is None and len(candidate) >= 24 and candidate in existing:
+            substring_match = idx
+    return substring_match
 
 
 def _journal_tool_already_present(
@@ -2635,6 +2707,12 @@ def _run_journal_has_visible_output(session, stream_id: str | None) -> bool:
                 continue
             if str(payload.get('text') or '').strip():
                 return True
+        if event_name == 'reasoning':
+            reasoning_text = str(
+                payload.get('text') or payload.get('reasoning') or payload.get('thinking') or ''
+            )
+            if reasoning_text.strip():
+                return True
         if event_name == 'tool':
             return True
     return False
@@ -2695,9 +2773,10 @@ def _append_journaled_partial_output(
     """Recover already-emitted visible output from a dead stream journal.
 
     This repair path is intentionally conservative: it restores user-visible
-    assistant text and tool-card metadata that had already been emitted over
-    SSE before the WebUI process died. It does not restore hidden reasoning and
-    it does not try to continue execution.
+    assistant text, display-only reasoning, and tool-card metadata that had
+    already been emitted over SSE before the WebUI process died. Restored
+    reasoning stays out of ``context_messages`` so it cannot become provider-
+    facing history. The repair does not try to continue execution.
     """
     if not stream_id:
         return False
@@ -2720,24 +2799,120 @@ def _append_journaled_partial_output(
 
     appended_any = False
     assistant_parts: list[str] = []
+    reasoning_parts: list[str] = []
     assistant_started_at: float | None = None
     current_assistant_idx: int | None = None
     recovered_tool_calls: list[dict] = []
+    initial_message_count = len(session.messages or [])
+    claimed_existing_assistant_indexes: set[int] = set()
+
+    def content_match_can_receive_reasoning(existing_idx: int) -> bool:
+        messages = session.messages or []
+        owner_idx = None
+        for candidate_idx in range(existing_idx - 1, -1, -1):
+            candidate = messages[candidate_idx]
+            if isinstance(candidate, dict) and candidate.get('role') == 'user':
+                owner_idx = candidate_idx
+                break
+        if owner_idx is None:
+            return False
+
+        pending_text = _normalize_journal_recovery_text(session.pending_user_message)
+        if pending_text and not _message_matches_pending_checkpoint(
+            messages[owner_idx],
+            session.pending_user_message,
+            session.pending_started_at,
+            session.pending_user_source,
+            session.pending_attachments,
+        ):
+            return False
+
+        for candidate_idx in range(existing_idx + 1, initial_message_count):
+            candidate = messages[candidate_idx]
+            if not isinstance(candidate, dict) or candidate.get('role') != 'user':
+                continue
+            candidate_text = _normalize_journal_recovery_text(candidate.get('content'))
+            candidate_matches_checkpoint = pending_text and _message_matches_pending_checkpoint(
+                candidate,
+                session.pending_user_message,
+                session.pending_started_at,
+                session.pending_user_source,
+                session.pending_attachments,
+            )
+            if candidate_matches_checkpoint and candidate.get('_recovered'):
+                continue
+            if pending_text and candidate_text == pending_text:
+                return False
+            return False
+        return True
+
+    def append_context_projection(message: dict) -> None:
+        context_projection = dict(message)
+        context_projection.pop('reasoning', None)
+        _append_recovered_turn_to_context(session, context_projection)
+
+    def attach_display_reasoning(message: dict, reasoning: str) -> bool:
+        if not reasoning:
+            return False
+        existing = str(message.get('reasoning') or '').strip()
+        if existing:
+            return False
+        message['reasoning'] = reasoning
+        return True
 
     def flush_assistant() -> int | None:
-        nonlocal appended_any, assistant_parts, assistant_started_at, current_assistant_idx
+        nonlocal appended_any, assistant_parts, reasoning_parts
+        nonlocal assistant_started_at, current_assistant_idx
         content = ''.join(assistant_parts).strip()
+        reasoning = ''.join(reasoning_parts).strip()
         assistant_parts = []
-        if not content:
+        reasoning_parts = []
+        if not content and not reasoning:
             return current_assistant_idx
-        if dedupe_existing:
-            existing_idx = _find_existing_assistant_for_journal_content(session, content)
+        if dedupe_existing and content:
+            search_excluded = set(claimed_existing_assistant_indexes)
+            existing_idx = None
+            while True:
+                candidate_idx = _find_existing_assistant_for_journal_content(
+                    session,
+                    content,
+                    max_index=initial_message_count,
+                    excluded_indexes=search_excluded,
+                )
+                if candidate_idx is None:
+                    break
+                if not reasoning or content_match_can_receive_reasoning(candidate_idx):
+                    existing_idx = candidate_idx
+                    break
+                search_excluded.add(candidate_idx)
             if existing_idx is not None:
+                claimed_existing_assistant_indexes.add(existing_idx)
                 current_assistant_idx = existing_idx
                 assistant_started_at = None
                 if 0 <= existing_idx < len(session.messages):
-                    _append_recovered_turn_to_context(session, session.messages[existing_idx])
+                    existing_message = session.messages[existing_idx]
+                    append_context_projection(existing_message)
+                    if attach_display_reasoning(existing_message, reasoning):
+                        appended_any = True
                 return existing_idx
+        if dedupe_existing and reasoning and not content:
+            for existing_idx in range(initial_message_count):
+                if existing_idx in claimed_existing_assistant_indexes:
+                    continue
+                existing_message = session.messages[existing_idx]
+                if not isinstance(existing_message, dict):
+                    continue
+                if (
+                    existing_message.get('_recovered_from_run_journal')
+                    and existing_message.get('_recovered_stream_id') == stream_id
+                    and existing_message.get('role') == 'assistant'
+                    and not str(existing_message.get('content') or '').strip()
+                    and str(existing_message.get('reasoning') or '').strip() == reasoning
+                ):
+                    claimed_existing_assistant_indexes.add(existing_idx)
+                    current_assistant_idx = existing_idx
+                    assistant_started_at = None
+                    return existing_idx
         timestamp = int(assistant_started_at or time.time())
         recovered_assistant = {
             'role': 'assistant',
@@ -2746,8 +2921,9 @@ def _append_journaled_partial_output(
             '_recovered_from_run_journal': True,
             '_recovered_stream_id': stream_id,
         }
+        attach_display_reasoning(recovered_assistant, reasoning)
         session.messages.append(recovered_assistant)
-        _append_recovered_turn_to_context(session, recovered_assistant)
+        append_context_projection(recovered_assistant)
         current_assistant_idx = len(session.messages) - 1
         assistant_started_at = None
         appended_any = True
@@ -2782,6 +2958,7 @@ def _append_journaled_partial_output(
                 and _m.get('_recovered_stream_id') == stream_id
                 and _m.get('role') == 'assistant'
                 and not str(_m.get('content') or '').strip()
+                and not str(_m.get('reasoning') or '').strip()
             ):
                 current_assistant_idx = _existing_idx
                 return _existing_idx
@@ -2800,6 +2977,16 @@ def _append_journaled_partial_output(
         event_name = str(event.get('event') or event.get('type') or '')
         payload = event.get('payload') if isinstance(event.get('payload'), dict) else {}
         created_at = event.get('created_at') if isinstance(event.get('created_at'), (int, float)) else None
+        if event_name == 'reasoning':
+            text = str(
+                payload.get('text') or payload.get('reasoning') or payload.get('thinking') or ''
+            )
+            if not text:
+                continue
+            if not assistant_parts and not reasoning_parts and assistant_started_at is None:
+                assistant_started_at = created_at or time.time()
+            reasoning_parts.append(text)
+            continue
         if event_name == 'token':
             text = str(payload.get('text') or '')
             if not text:
@@ -4462,45 +4649,30 @@ def _evict_sessions_over_cap(cap: int | None = None) -> int:
 def get_session_for_scan(sid):
     """Read a session for a one-pass scan without disturbing the LRU.
 
-    ``/api/sessions/search?content=1`` walks EVERY session. Routing that through
-    ``get_session()`` inserts each one into the LRU and marks it recently-used,
-    so a single content search over an install with more sessions than
-    ``sessions_cache_max`` evicts the entire working set the cache exists to
-    hold — the classic buffer-pool scan-pollution problem. The sessions the user
-    actually has open are the ones that get thrown out.
-
-    A scan reads each session exactly once, so nothing it touches has earned
-    "recently used". Resident sessions are reused (free, and deliberately NOT
-    promoted); a miss is read straight from disk and NOT cached.
-
-    Returns ``None`` when the session cannot be read, rather than raising —
-    a scan skips what it cannot open.
+    The scan uses the full canonical resolver so stale sidecars, pending journal
+    recovery, and newer state.db transcript rows remain searchable. It only
+    differs from ``get_session`` in cache policy: no hit promotion, no cold-load
+    insertion, and therefore no scan-triggered eviction.
     """
-    with LOCK:
-        cached = SESSIONS.get(sid)  # NB: no move_to_end() — a scan never promotes
-    # Same defensive ownership check as get_session(): never hand back an object
-    # filed under the wrong lineage id.
-    if cached is not None and str(getattr(cached, 'session_id', '') or '') == str(sid):
-        if not getattr(cached, '_loaded_metadata_only', False):
-            return cached
     try:
-        return Session.load(sid)
+        return _resolve_session(sid, promote_cache=False, cache_on_miss=False)
     except Exception:
         logger.debug("scan load failed for session %s", sid, exc_info=True)
         return None
 
 
-def get_session(sid, metadata_only=False):
-    """Load a session, optionally with metadata only (skipping the messages array).
+def _resolve_session(sid, metadata_only=False, *, promote_cache=True, cache_on_miss=True):
+    """Resolve a session through the canonical freshness/recovery path.
 
-    Metadata-only loads intentionally do not populate the full-session cache.
-    Otherwise a later full load could return a compact object with an empty
-    messages list. Use this when you only need compact() metadata and not the
-    actual message history (e.g., for fast sidebar switching).
+    ``get_session_for_scan`` shares this resolver with normal reads so that
+    content search sees the same disk freshness, journal-retry, and state.db
+    recovery behavior. Its policy merely suppresses LRU promotion and cold-load
+    caching; reconciliation still updates an already-resident entry when normal
+    resolution replaces stale contents.
     """
     with LOCK:
         cached = SESSIONS.get(sid)
-        if cached is not None:
+        if cached is not None and promote_cache:
             SESSIONS.move_to_end(sid)  # LRU: mark as recently used
     if cached is not None:
         # Defensive cache ownership check: compression/continuation and recovery
@@ -4524,12 +4696,12 @@ def get_session(sid, metadata_only=False):
                 disk_session = Session.load(sid)
                 with LOCK:
                     SESSIONS[sid] = disk_session
-                    SESSIONS.move_to_end(sid)
+                    if promote_cache:
+                        SESSIONS.move_to_end(sid)
                 cached = disk_session
             except Exception:
                 logger.debug(
-                    "cached session disk-freshness check failed for session %s",
-                    sid, exc_info=True,
+                    "cached session disk-freshness check failed for session %s", sid, exc_info=True,
                 )
         if not metadata_only and _inactive_cache_tail_needs_disk_check(cached):
             try:
@@ -4537,28 +4709,26 @@ def get_session(sid, metadata_only=False):
                 if _cache_has_stale_unsaved_user_tail(cached, disk_session):
                     with LOCK:
                         SESSIONS[sid] = disk_session
-                        SESSIONS.move_to_end(sid)
+                        if promote_cache:
+                            SESSIONS.move_to_end(sid)
                     cached = disk_session
             except Exception:
                 logger.debug(
-                    "stale cached user-tail check failed for session %s",
-                    sid, exc_info=True,
+                    "stale cached user-tail check failed for session %s", sid, exc_info=True,
                 )
         if not metadata_only and _session_has_pending_journal_retry(cached):
             try:
                 _try_retry_journal_recovery_in_place(cached)
             except Exception:
                 logger.debug(
-                    "lazy journal-retry failed on cache hit for session %s",
-                    sid, exc_info=True,
+                    "lazy journal-retry failed on cache hit for session %s", sid, exc_info=True,
                 )
         if not metadata_only:
             try:
                 _sync_sidecar_from_state_db_if_newer(cached)
             except Exception:
                 logger.debug(
-                    "state.db newer-sidecar sync failed on cache hit for session %s",
-                    sid, exc_info=True,
+                    "state.db newer-sidecar sync failed on cache hit for session %s", sid, exc_info=True,
                 )
         return cached
     if metadata_only:
@@ -4568,10 +4738,12 @@ def get_session(sid, metadata_only=False):
     else:
         s = Session.load(sid)
     if s:
-        with LOCK:
-            SESSIONS[sid] = s
-            SESSIONS.move_to_end(sid)
-            _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
+        if cache_on_miss:
+            with LOCK:
+                SESSIONS[sid] = s
+                if promote_cache:
+                    SESSIONS.move_to_end(sid)
+                _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
         if not metadata_only:
             try:
                 synced_from_state = _sync_sidecar_from_state_db_if_newer(s)
@@ -4585,14 +4757,13 @@ def get_session(sid, metadata_only=False):
                         _try_retry_journal_recovery_in_place(s)
                     except Exception:
                         logger.debug(
-                            "lazy journal-retry failed on cold load for session %s",
-                            sid, exc_info=True,
+                            "lazy journal-retry failed on cold load for session %s", sid, exc_info=True,
                         )
                 # If repair had to bail because the per-session lock was held,
                 # do not pin the still-stale sidecar in the LRU cache forever.
                 # Leaving it cached would prevent future get_session() calls from
                 # re-entering the cache-miss repair path after the lock holder exits.
-                if not repaired and (len(s.messages) == 0
+                if cache_on_miss and not repaired and (len(s.messages) == 0
                         and s.pending_user_message
                         and s.active_stream_id
                         and s.active_stream_id not in _active_stream_ids()):
@@ -4603,6 +4774,11 @@ def get_session(sid, metadata_only=False):
                 pass  # repair is best-effort
         return s
     raise KeyError(sid)
+
+
+def get_session(sid, metadata_only=False):
+    """Load a session, optionally with metadata only (skipping messages)."""
+    return _resolve_session(sid, metadata_only=metadata_only)
 
 
 _COMPRESSION_RECOVERY_PROFILE_UNSET = object()
@@ -8055,6 +8231,7 @@ _SESSION_MESSAGE_DISPLAY_METADATA_KEYS = (
     "_turnTps",
     "_turnUsage",
     "_firstTokenMs",
+    "_usedModel",
     "_gatewayRouting",
     "_statusCard",
     "_anchor_stream_id",
