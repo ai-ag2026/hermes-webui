@@ -371,6 +371,20 @@ VENV_PYTHON  = _discover_python(HERMES_AGENT)
 # Work dir: agent dir if found, else repo root
 WORKDIR = str(HERMES_AGENT) if HERMES_AGENT else str(REPO_ROOT)
 
+# Wire the agent checkout into sys.path HERE, at conftest import time — not
+# only as an api.config side effect. Two failure modes this closes (TARS-Review
+# 23.07.2026, M3: 55 kanban-bridge/gate ERRORs in both full-suite pair runs):
+#  1. A test file whose fixtures `import hermes_cli` directly can run before
+#     anything imported api.config, so the path was never added.
+#  2. The sys.path integrity guard below snapshots _REAL_SYS_PATH at import
+#     time; if the agent dir was added LATER (api.config import during some
+#     earlier test), the guard's restore silently STRIPS it again for every
+#     test after the first sys.path mutation.
+# Appended at the END like api/config.py does, so the agent's vendored deps
+# can never shadow the venv (see the comment there).
+if HERMES_AGENT and str(HERMES_AGENT) not in sys.path:
+    sys.path.append(str(HERMES_AGENT))
+
 # ── Agent availability detection ─────────────────────────────────────────────
 # Tests that require hermes-agent modules (cron, skills, approval, chat/stream)
 # are skipped when the agent isn't installed, instead of failing with 500 errors.
@@ -675,8 +689,22 @@ def pytest_collection_modifyitems(config, items):
     skip_marker = pytest.mark.skip(reason="requires hermes-agent (not installed)")
     skipped = 0
 
+    # Kanban-bridge/gate series: their fixtures `import hermes_cli` directly,
+    # so without an agent checkout they ERROR at setup instead of failing a
+    # server call. Skip them by module prefix (TARS-Review 23.07.2026, M3).
+    _AGENT_DEPENDENT_MODULE_PREFIXES = (
+        "test_kanban_bridge_",
+        "test_kanban_gated_",
+        "test_kanban_reopen",
+        "test_kanban_unblock_typed_attention",
+        "test_kanban_technical_park_retry",
+        "test_kanban_artifacts_in_detail",
+    )
+
     for item in items:
-        if item.name in _AGENT_DEPENDENT_TESTS:
+        if item.name in _AGENT_DEPENDENT_TESTS or item.fspath.basename.startswith(
+            _AGENT_DEPENDENT_MODULE_PREFIXES
+        ):
             item.add_marker(skip_marker)
             skipped += 1
 
