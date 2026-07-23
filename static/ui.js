@@ -10865,7 +10865,11 @@ function _assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs){
 }
 function _assistantReasoningPayloadText(m){
   if(!m||m.role!=='assistant') return '';
-  if(_assistantReasoningPayloadIsHistoricalToolCallOnly(m)) return '';
+  // Fork-Guard; typeof-gated so partial-extraction harnesses (upstream's
+  // issue6220 hydration tests load a fixed function list into a vm sandbox)
+  // see upstream behavior instead of a ReferenceError.
+  if(typeof _assistantReasoningPayloadIsHistoricalToolCallOnly==='function'
+     && _assistantReasoningPayloadIsHistoricalToolCallOnly(m)) return '';
   const direct=m.reasoning_content||m.reasoning||m.thinking||m._reasoning||'';
   if(String(direct||'').trim()) return String(direct).trim();
   if(Array.isArray(m.content)){
