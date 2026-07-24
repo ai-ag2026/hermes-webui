@@ -13625,6 +13625,12 @@ def handle_get(handler, parsed) -> bool:
         data = _skills_list_from_dir(_active_skills_dir(), category=category)
         return j(handler, {"skills": data.get("skills", [])})
 
+    if parsed.path == "/api/skills/record/status":
+        return _handle_skill_record_status(handler, parse_qs(parsed.query))
+
+    if parsed.path == "/api/skills/record/capabilities":
+        return _handle_skill_record_capabilities(handler)
+
     if parsed.path == "/api/skills/usage":
         from api.skill_usage import read_skill_usage
         raw = read_skill_usage(_active_skills_dir())
@@ -14006,6 +14012,18 @@ def handle_post(handler, parsed) -> bool:
     if not _csrf_exempt_path(parsed.path) and not _check_csrf(handler):
         try:
             return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
+        finally:
+            if diag:
+                diag.finish()
+    # Aufnahme-Upload: muss VOR jedem body-lesenden Zweig liegen, weil die Datei
+    # chunkweise vom Socket auf Platte gestreamt wird. Der übliche
+    # read_body()/parse_multipart()-Weg würde sie komplett in den RAM ziehen
+    # (gemessen: das Vierfache der Nutzlast).
+    if parsed.path == "/api/skills/record":
+        if diag:
+            diag.stage("skill_record_ingest")
+        try:
+            return _handle_skill_record_upload(handler)
         finally:
             if diag:
                 diag.finish()
@@ -15639,6 +15657,12 @@ def handle_post(handler, parsed) -> bool:
     # ── Skills (POST) ──
     if parsed.path == "/api/skills/save":
         return _handle_skill_save(handler, body)
+
+    if parsed.path == "/api/skills/record/save":
+        return _handle_skill_record_save(handler, body)
+
+    if parsed.path == "/api/skills/record/cancel":
+        return _handle_skill_record_cancel(handler, body)
 
     if parsed.path == "/api/skills/delete":
         return _handle_skill_delete(handler, body)
@@ -25856,6 +25880,162 @@ def _handle_skill_save(handler, body):
     skill_file.write_text(body["content"], encoding="utf-8")
     _SKILLS_STATS_CACHE.clear()
     return j(handler, {"ok": True, "name": skill_name, "path": str(skill_file)})
+
+
+# ── Record a Skill (Bildschirmaufnahme → SKILL.md) ───────────────────────────
+# Das Feature ist opt-in. Ist es aus, verhalten sich alle vier Endpunkte, als
+# gäbe es sie nicht (404) — kein Verzeichnis, kein Job, kein Unterprozess.
+_SKILL_RECORD_THREADS: dict[str, object] = {}
+
+
+def _skill_record_guard(handler):
+    """(conf, owner) liefern oder eine fertige 404-Antwort zurückgeben."""
+    from api.skill_recording import ensure_swept, owner_token, recording_config
+
+    conf = recording_config()
+    if not conf.get("enabled"):
+        return None, None, j(handler, {"error": "not found"}, status=404)
+    ensure_swept(conf)
+    return conf, owner_token(handler), None
+
+
+def _skill_record_error(handler, exc):
+    from api.skill_recording import RecordingError
+
+    if isinstance(exc, RecordingError):
+        return bad(handler, str(exc), status=exc.status)
+    logger.exception("skill_recording: unerwarteter Fehler")
+    return bad(handler, "Interner Fehler bei der Aufnahmeverarbeitung", status=500)
+
+
+def _handle_skill_record_capabilities(handler):
+    """Was das Frontend wissen muss, bevor es den Button überhaupt anbietet."""
+    from api.skill_recording import ensure_swept, recording_config, tools_available
+
+    conf = recording_config()
+    if not conf.get("enabled"):
+        return j(handler, {"enabled": False})
+    # Der Skills-Tab fragt das beim Öffnen ab — der passende Moment, verwaiste
+    # Jobs eines früheren Prozesses abzuräumen.
+    ensure_swept(conf)
+    keyframes = conf.get("keyframes", {})
+    return j(handler, {
+        "enabled": True,
+        "tools_available": tools_available(),
+        "max_duration_s": int(conf.get("max_duration_s", 600)),
+        "max_upload_mb": int(conf.get("max_upload_mb", 150)),
+        "max_frames": int(keyframes.get("max_frames", 24)),
+    })
+
+
+def _handle_skill_record_upload(handler):
+    """Streaming-Ingest + Start der Hintergrundverarbeitung."""
+    import threading
+
+    from api.skill_recording import (Job, RecordingError, active_jobs,
+                                     ensure_swept, job_dir, new_job_id,
+                                     owner_token, recording_config, run_pipeline,
+                                     stream_recording_upload, tools_available,
+                                     _write_job)
+
+    conf = recording_config()
+    if not conf.get("enabled"):
+        return j(handler, {"error": "not found"}, status=404)
+    ensure_swept(conf)
+    if not tools_available():
+        return bad(handler, "ffmpeg/ffprobe sind auf dem Server nicht installiert", status=501)
+
+    owner = owner_token(handler)
+    max_jobs = int(conf.get("max_concurrent_jobs", 1))
+    running = active_jobs(conf)
+    if len(running) >= max_jobs:
+        return bad(handler, "Es läuft bereits eine Aufnahme-Auswertung. "
+                            "Bitte warte, bis sie fertig ist.", status=429)
+
+    job = Job(job_id=new_job_id(), owner=owner)
+    directory = job_dir(job.job_id, conf)
+    try:
+        stream_recording_upload(
+            handler.rfile,
+            handler.headers.get("Content-Type", ""),
+            handler.headers.get("Content-Length", ""),
+            directory,
+            int(conf.get("max_upload_mb", 150)) * 1024 * 1024,
+        )
+        _write_job(job, conf)
+    except RecordingError as exc:
+        import shutil as _shutil
+        _shutil.rmtree(directory, ignore_errors=True)
+        return _skill_record_error(handler, exc)
+    except Exception as exc:  # noqa: BLE001
+        import shutil as _shutil
+        _shutil.rmtree(directory, ignore_errors=True)
+        return _skill_record_error(handler, exc)
+
+    thread = threading.Thread(
+        target=run_pipeline, args=(job, conf), name=f"skill-rec-{job.job_id[:8]}",
+        daemon=True)
+    _SKILL_RECORD_THREADS[job.job_id] = thread
+    thread.start()
+    return j(handler, {"job_id": job.job_id, "state": job.state})
+
+
+def _handle_skill_record_status(handler, query):
+    from api.skill_recording import RecordingError, load_job_for_owner
+
+    conf, owner, denied = _skill_record_guard(handler)
+    if denied is not None:
+        return denied
+    job_id = (query.get("job_id", [""])[0] or "").strip()
+    try:
+        job = load_job_for_owner(job_id, owner, conf)
+    except RecordingError as exc:
+        return _skill_record_error(handler, exc)
+    return j(handler, job.public())
+
+
+def _handle_skill_record_cancel(handler, body):
+    from api.skill_recording import RecordingError, discard_job, load_job_for_owner
+
+    conf, owner, denied = _skill_record_guard(handler)
+    if denied is not None:
+        return denied
+    try:
+        job = load_job_for_owner(str(body.get("job_id", "")).strip(), owner, conf)
+        discard_job(job, conf)
+    except RecordingError as exc:
+        return _skill_record_error(handler, exc)
+    _SKILL_RECORD_THREADS.pop(job.job_id, None)
+    return j(handler, {"ok": True, "job_id": job.job_id, "state": "dismissed"})
+
+
+def _handle_skill_record_save(handler, body):
+    """Die gesicherte Commit-Transaktion — bewusst nicht _handle_skill_save."""
+    from api.skill_recording import (RecordingError, commit_skill, discard_job,
+                                     load_job_for_owner, _write_job)
+
+    conf, owner, denied = _skill_record_guard(handler)
+    if denied is not None:
+        return denied
+    try:
+        job = load_job_for_owner(str(body.get("job_id", "")).strip(), owner, conf)
+        if job.state not in {"ready", "error"} or not (job.draft_md or body.get("content")):
+            raise RecordingError("Für diesen Job liegt kein Entwurf vor", 409)
+        content = str(body.get("content") or job.draft_md or "")
+        result = commit_skill(content, str(body.get("name", "")),
+                              str(body.get("category", "")))
+    except RecordingError as exc:
+        return _skill_record_error(handler, exc)
+    except Exception as exc:  # noqa: BLE001
+        return _skill_record_error(handler, exc)
+
+    job.state = "saved"
+    job.saved_path = result["path"]
+    _write_job(job, conf)
+    if not conf.get("retain_job_after_save"):
+        discard_job(job, conf)
+    _SKILLS_STATS_CACHE.clear()
+    return j(handler, {"ok": True, **result})
 
 
 def _handle_skill_delete(handler, body):

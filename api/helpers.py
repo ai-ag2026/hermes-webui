@@ -184,9 +184,15 @@ def _security_headers(handler):
     handler.send_header('X-Frame-Options', 'DENY')
     handler.send_header('Referrer-Policy', 'same-origin')
     handler.send_header(_CSP_HEADER_NAME, _build_csp_enforced_policy(extra_connect_src, extra_frame_src))
+    # display-capture=(self): getDisplayMedia für „Record a Skill". Der Wert
+    # entspricht dem Browser-Default für nicht aufgeführte Features, steht hier
+    # aber explizit, damit die Absicht sichtbar und prüfbar ist. Eine Aufnahme
+    # entsteht dadurch nicht — dafür braucht es weiterhin eine Nutzergeste und
+    # die Freigabe im Browser-Dialog.
     handler.send_header(
         'Permissions-Policy',
-        'camera=(), microphone=(self), geolocation=(), clipboard-write=(self)'
+        'camera=(), microphone=(self), geolocation=(), clipboard-write=(self), '
+        'display-capture=(self)'
     )
 
 
