@@ -5108,6 +5108,8 @@ async function clearConversation() {
 
 // ── Skills panel ──
 async function loadSkills() {
+  // Einmal je Sitzung klaeren, ob der Server die Aufnahmefunktion anbietet.
+  if (_skillRecCaps === null && typeof initSkillRecorder === 'function') initSkillRecorder();
   if (_skillsData) { renderSkills(_skillsData); return; }
   const box = $('skillsList');
   try {
@@ -13606,4 +13608,391 @@ function updateNotificationPermissionStatus(){
     btn.setAttribute('aria-disabled', granted?'true':'false');
   }
   if(btnWrap) btnWrap.title=label;
+}
+
+// ── Record a Skill ───────────────────────────────────────────────────────────
+// Screen recording + narration -> SKILL.md draft. Opt-in: the button stays
+// hidden until the server reports the feature as enabled.
+//
+// The upload uses XHR rather than fetch because only XHR reports upload
+// progress, and a recording can be well over a hundred megabytes. The CSRF
+// header is therefore set by hand — the global fetch wrapper in index.html does
+// not cover XHR.
+
+let _skillRecCaps = null;      // response of /api/skills/record/capabilities
+let _skillRecState = null;     // { recorder, stream, micStream, chunks, jobId, timer, ... }
+
+function _skillRecSecureContext() {
+  return !!(window.isSecureContext && navigator.mediaDevices &&
+            typeof navigator.mediaDevices.getDisplayMedia === 'function');
+}
+
+async function initSkillRecorder() {
+  const btn = $('skillRecordBtn');
+  if (!btn) return;
+  try {
+    _skillRecCaps = await api('/api/skills/record/capabilities');
+  } catch (e) {
+    _skillRecCaps = { enabled: false };
+  }
+  // The button also appears without a secure context and explains on click why
+  // recording is unavailable — an invisible button would just be a riddle.
+  btn.style.display = (_skillRecCaps && _skillRecCaps.enabled) ? '' : 'none';
+}
+
+function _skillRecPane(html, title) {
+  const body = $('skillDetailBody');
+  const empty = $('skillDetailEmpty');
+  const titleEl = $('skillDetailTitle');
+  if (!body) return;
+  if (titleEl) titleEl.textContent = title || t('record_skill');
+  body.innerHTML = `<div class="main-view-content">${html}</div>`;
+  body.style.display = '';
+  if (empty) empty.style.display = 'none';
+  if (typeof _setSkillHeaderButtons === 'function') _setSkillHeaderButtons('empty');
+}
+
+function openSkillRecorder() {
+  if (typeof switchPanel === 'function' && _currentPanel !== 'skills') switchPanel('skills');
+  if (!_skillRecCaps || !_skillRecCaps.enabled) {
+    _skillRecPane(`<div class="detail-form-error">${esc(t('rec_disabled'))}</div>`);
+    return;
+  }
+  if (!_skillRecCaps.tools_available) {
+    _skillRecPane(`<div class="detail-form-error">${esc(t('rec_no_tools'))}</div>`);
+    return;
+  }
+  if (!_skillRecSecureContext()) {
+    _skillRecPane(`
+      <div class="detail-form-hint" style="line-height:1.6">
+        <strong>${esc(t('rec_insecure_title'))}</strong><br>${esc(t('rec_insecure_body'))}
+      </div>`);
+    return;
+  }
+  const mins = Math.round((_skillRecCaps.max_duration_s || 600) / 60);
+  _skillRecPane(`
+    <div class="detail-form">
+      <div class="detail-form-hint" style="line-height:1.6">${esc(t('rec_intro'))}</div>
+      <div class="detail-form-error" style="display:block;background:transparent;line-height:1.6">
+        <strong>${esc(t('rec_warning_label'))}</strong> ${esc(t('rec_warning_body', mins))}
+      </div>
+      <div class="detail-form-row" style="flex-direction:row;gap:8px;align-items:center">
+        <label style="margin:0"><input type="checkbox" id="skillRecMic" checked> ${esc(t('rec_mic'))}</label>
+      </div>
+      <div class="detail-form-row">
+        <button type="button" class="btn" onclick="startSkillRecording()">${esc(t('rec_start'))}</button>
+      </div>
+      <div id="skillRecError" class="detail-form-error" style="display:none"></div>
+    </div>`);
+}
+
+function _skillRecFail(message) {
+  const el = $('skillRecError');
+  if (el) { el.textContent = message; el.style.display = ''; }
+  else _skillRecPane(`<div class="detail-form-error">${esc(message)}</div>`);
+}
+
+function _skillRecStopTracks() {
+  const st = _skillRecState;
+  if (!st) return;
+  for (const s of [st.stream, st.micStream]) {
+    if (s) { try { s.getTracks().forEach(tr => tr.stop()); } catch (_) {} }
+  }
+  if (st.timer) { clearInterval(st.timer); st.timer = null; }
+}
+
+async function startSkillRecording() {
+  const wantMic = !!($('skillRecMic') && $('skillRecMic').checked);
+  const maxS = (_skillRecCaps && _skillRecCaps.max_duration_s) || 600;
+  let stream = null, micStream = null;
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: { ideal: 5, max: 10 } }, audio: false });
+  } catch (e) {
+    // Dismissing the browser dialog is a decision, not an error.
+    if (e && (e.name === 'NotAllowedError' || e.name === 'AbortError')) _skillRecFail(t('rec_cancelled'));
+    else _skillRecFail(t('rec_screen_failed', (e && e.message) || e));
+    return;
+  }
+  if (wantMic) {
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      // Without audio the draft gets weaker, but the recording still works.
+      showToast(t('rec_no_mic'), null, 'warning');
+    }
+  }
+
+  const tracks = [...stream.getVideoTracks(), ...(micStream ? micStream.getAudioTracks() : [])];
+  const mixed = new MediaStream(tracks);
+  const mime = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm']
+    .find(m => window.MediaRecorder && MediaRecorder.isTypeSupported(m));
+  if (!mime) {
+    try { stream.getTracks().forEach(tr => tr.stop()); } catch (_) {}
+    if (micStream) { try { micStream.getTracks().forEach(tr => tr.stop()); } catch (_) {} }
+    _skillRecFail(t('rec_no_webm'));
+    return;
+  }
+  let recorder;
+  try {
+    // The bitrate is pinned on purpose: with the browser default a ten-minute
+    // recording easily reaches ~190 MB.
+    recorder = new MediaRecorder(mixed, { mimeType: mime, videoBitsPerSecond: 1500000 });
+  } catch (e) {
+    try { stream.getTracks().forEach(tr => tr.stop()); } catch (_) {}
+    if (micStream) { try { micStream.getTracks().forEach(tr => tr.stop()); } catch (_) {} }
+    _skillRecFail(t('rec_start_failed', (e && e.message) || e));
+    return;
+  }
+
+  _skillRecState = { recorder, stream, micStream, chunks: [], startedAt: Date.now(),
+                     mime, timer: null };
+  recorder.ondataavailable = ev => { if (ev.data && ev.data.size) _skillRecState.chunks.push(ev.data); };
+  recorder.onstop = () => _finishSkillRecording();
+  // The user can also revoke sharing from the browser's own bar.
+  stream.getVideoTracks().forEach(tr => tr.addEventListener('ended', () => {
+    if (_skillRecState && _skillRecState.recorder && _skillRecState.recorder.state === 'recording') {
+      try { _skillRecState.recorder.stop(); } catch (_) {}
+    }
+  }));
+  recorder.start(1000);
+
+  _skillRecPane(`
+    <div class="detail-form">
+      <div class="detail-form-row" style="align-items:center;gap:10px">
+        <span style="display:inline-flex;align-items:center;gap:8px;font-size:15px">
+          <span style="width:10px;height:10px;border-radius:50%;background:var(--accent);display:inline-block"></span>
+          <strong>${esc(t('rec_running'))}</strong>
+          <span id="skillRecClock" style="font-variant-numeric:tabular-nums">00:00</span>
+          <span style="opacity:.6">/ ${esc(_fmtClock(maxS))}</span>
+        </span>
+      </div>
+      <div class="detail-form-hint">${esc(t('rec_speak_hint'))}</div>
+      <div class="detail-form-row">
+        <button type="button" class="btn" onclick="stopSkillRecording()">${esc(t('rec_stop'))}</button>
+      </div>
+      <div id="skillRecError" class="detail-form-error" style="display:none"></div>
+    </div>`);
+
+  _skillRecState.timer = setInterval(() => {
+    const st = _skillRecState;
+    if (!st || !st.recorder) return;
+    const elapsed = Math.floor((Date.now() - st.startedAt) / 1000);
+    const clock = $('skillRecClock');
+    if (clock) clock.textContent = _fmtClock(elapsed);
+    if (elapsed >= maxS && st.recorder.state === 'recording') {
+      showToast(t('rec_time_limit'), null, 'warning');
+      try { st.recorder.stop(); } catch (_) {}
+    }
+  }, 1000);
+}
+
+function _fmtClock(totalSeconds) {
+  const s = Math.max(0, Math.floor(totalSeconds));
+  return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+}
+
+function stopSkillRecording() {
+  const st = _skillRecState;
+  if (!st || !st.recorder || st.recorder.state !== 'recording') return;
+  try { st.recorder.stop(); } catch (e) { _skillRecFail(t('rec_stop_failed', e.message)); }
+}
+
+function _finishSkillRecording() {
+  const st = _skillRecState;
+  if (!st) return;
+  _skillRecStopTracks();
+  const blob = new Blob(st.chunks, { type: st.mime });
+  st.chunks = [];
+  if (!blob.size) {
+    _skillRecPane(`<div class="detail-form-error">${esc(t('rec_empty'))}</div>`);
+    _skillRecState = null;
+    return;
+  }
+  const limitMb = (_skillRecCaps && _skillRecCaps.max_upload_mb) || 150;
+  if (blob.size > limitMb * 1024 * 1024) {
+    _skillRecPane(`<div class="detail-form-error">${esc(
+      t('rec_too_big', (blob.size / 1048576).toFixed(0), limitMb))}</div>`);
+    _skillRecState = null;
+    return;
+  }
+  _uploadSkillRecording(blob);
+}
+
+function _uploadSkillRecording(blob) {
+  _skillRecPane(`
+    <div class="detail-form">
+      <div class="detail-form-row">
+        <strong>${esc(t('rec_uploading'))}</strong>
+        <div style="height:6px;background:var(--border);border-radius:3px;overflow:hidden;margin-top:8px">
+          <div id="skillRecBar" style="height:100%;width:0;background:var(--accent);transition:width .2s"></div>
+        </div>
+        <div id="skillRecPct" class="detail-form-hint">0 %</div>
+      </div>
+      <div id="skillRecError" class="detail-form-error" style="display:none"></div>
+    </div>`);
+
+  const form = new FormData();
+  form.append('file', blob, 'recording.webm');
+  const xhr = new XMLHttpRequest();
+  const url = new URL('api/skills/record', document.baseURI || location.href);
+  xhr.open('POST', url.toString(), true);
+  xhr.withCredentials = true;
+  const token = (window.__HERMES_CONFIG__ || {}).csrfToken;
+  if (token) xhr.setRequestHeader('X-Hermes-CSRF-Token', token);
+  xhr.upload.onprogress = ev => {
+    if (!ev.lengthComputable) return;
+    const pct = Math.round((ev.loaded / ev.total) * 100);
+    const bar = $('skillRecBar'), lab = $('skillRecPct');
+    if (bar) bar.style.width = pct + '%';
+    if (lab) lab.textContent = pct + ' %';
+  };
+  xhr.onload = () => {
+    let data = {};
+    try { data = JSON.parse(xhr.responseText || '{}'); } catch (_) {}
+    if (xhr.status >= 200 && xhr.status < 300 && data.job_id) {
+      _skillRecState = { jobId: data.job_id };
+      _pollSkillRecording(data.job_id);
+    } else {
+      _skillRecPane(`<div class="detail-form-error">${esc(
+        data.error || t('rec_upload_failed', xhr.status))}</div>`);
+      _skillRecState = null;
+    }
+  };
+  xhr.onerror = () => {
+    _skillRecPane(`<div class="detail-form-error">${esc(t('rec_upload_lost'))}</div>`);
+    _skillRecState = null;
+  };
+  xhr.send(form);
+}
+
+function _skillRecStageLabel(state) {
+  const key = {
+    queued: 'rec_stage_queued', probing: 'rec_stage_probing',
+    transcribing: 'rec_stage_transcribing', extracting: 'rec_stage_extracting',
+    synthesizing: 'rec_stage_synthesizing',
+  }[state];
+  return key ? t(key) : state;
+}
+
+async function _pollSkillRecording(jobId) {
+  let job = null;
+  try {
+    job = await api(`/api/skills/record/status?job_id=${encodeURIComponent(jobId)}`, { retries: 2 });
+  } catch (e) {
+    _skillRecPane(`<div class="detail-form-error">${esc(t('rec_status_failed', e.message))}</div>`);
+    return;
+  }
+  if (!_skillRecState || _skillRecState.jobId !== jobId) return;  // dismissed meanwhile
+
+  if (job.state === 'ready') { _renderSkillRecDraft(job); return; }
+  if (job.state === 'error' || job.state === 'interrupted') {
+    _skillRecPane(`
+      <div class="detail-form">
+        <div class="detail-form-error" style="display:block">${esc(job.error || t('rec_failed'))}</div>
+        <div class="detail-form-row"><button type="button" class="btn" onclick="openSkillRecorder()">${esc(t('rec_again'))}</button></div>
+      </div>`);
+    _skillRecState = null;
+    return;
+  }
+  _skillRecPane(`
+    <div class="detail-form">
+      <div class="detail-form-row">
+        <strong>${esc(_skillRecStageLabel(job.state))}</strong>
+        <div class="detail-form-hint">${esc(t('rec_processing_hint'))}</div>
+      </div>
+      <div class="detail-form-row">
+        <button type="button" class="btn" onclick="dismissSkillRecording()">${esc(t('rec_cancel'))}</button>
+      </div>
+    </div>`);
+  setTimeout(() => _pollSkillRecording(jobId), 2000);
+}
+
+function _renderSkillRecDraft(job) {
+  const md = job.draft_md || '';
+  const nameMatch = md.match(/^name:\s*(.+)$/m);
+  const suggested = nameMatch ? nameMatch[1].trim().replace(/^["']|["']$/g, '') : '';
+  const conf = (job.confidence == null) ? null : Math.round(job.confidence * 100);
+  const limitations = (job.limitations || []).map(l => `<li>${esc(l)}</li>`).join('');
+  const similar = (job.similar || []).map(s => `<code>${esc(s)}</code>`).join(' ');
+  const notes = (job.notes || []).map(n => `<li>${esc(n)}</li>`).join('');
+  const meta = [
+    t('rec_draft_header'),
+    conf == null ? null : t('rec_confidence', conf),
+    job.frames_used ? t('rec_frames', job.frames_used) : null,
+    job.duration_s ? t('rec_duration', _fmtClock(job.duration_s)) : null,
+  ].filter(Boolean).join(' · ');
+
+  _skillRecPane(`
+    <form class="detail-form" onsubmit="event.preventDefault(); saveRecordedSkill();">
+      <div class="detail-form-hint" style="line-height:1.6">
+        ${esc(meta)}<br><em>${esc(t('rec_review_hint'))}</em>
+      </div>
+      ${similar ? `<div class="detail-form-hint">${esc(t('rec_similar'))} ${similar}</div>` : ''}
+      ${limitations ? `<div class="detail-form-hint"><strong>${esc(t('rec_limitations'))}</strong><ul style="margin:4px 0 0 16px">${limitations}</ul></div>` : ''}
+      ${notes ? `<div class="detail-form-hint"><ul style="margin:4px 0 0 16px">${notes}</ul></div>` : ''}
+      <div class="detail-form-row">
+        <label for="skillRecName">${esc(t('skill_name'))}</label>
+        <input type="text" id="skillRecName" value="${esc(suggested)}" placeholder="my-skill" autocomplete="off" required>
+      </div>
+      <div class="detail-form-row">
+        <label for="skillRecCategory">${esc(t('skill_category'))}</label>
+        <input type="text" id="skillRecCategory" value="" placeholder="${esc(t('skill_category_placeholder'))}" autocomplete="off">
+      </div>
+      <div class="detail-form-row">
+        <label for="skillRecContent">${esc(t('skill_content'))}</label>
+        <textarea id="skillRecContent" rows="20">${esc(md)}</textarea>
+      </div>
+      <div class="detail-form-row" style="flex-direction:row;gap:8px">
+        <button type="submit" class="btn">${esc(t('save'))}</button>
+        <button type="button" class="btn" onclick="dismissSkillRecording()">${esc(t('rec_discard'))}</button>
+      </div>
+      <div id="skillRecError" class="detail-form-error" style="display:none"></div>
+    </form>`);
+}
+
+async function saveRecordedSkill() {
+  const st = _skillRecState;
+  if (!st || !st.jobId) return;
+  const name = ($('skillRecName').value || '').trim();
+  const category = ($('skillRecCategory').value || '').trim();
+  const content = $('skillRecContent').value;
+  if (!name) { _skillRecFail(t('skill_name_required')); return; }
+  if (!content.trim()) { _skillRecFail(t('content_required')); return; }
+  try {
+    // Saving runs backup + validation + scan + readback server-side and can
+    // take a while; no retries, because a repeat would hit the collision check.
+    const res = await api('/api/skills/record/save', {
+      method: 'POST', timeoutMs: 180000, retries: 0,
+      body: JSON.stringify({ job_id: st.jobId, name, category: category || undefined, content }),
+    });
+    showToast(t('skill_created'));
+    if (res && res.sync && res.sync !== 'Profile synchronisiert') showToast(res.sync, null, 'warning');
+    _skillRecState = null;
+    _skillsData = null;
+    _cronSkillsCache = null;
+    if (typeof window !== 'undefined' && typeof window.invalidateSlashSkillCaches === 'function') {
+      window.invalidateSlashSkillCaches();
+    }
+    await loadSkills();
+    if (typeof openSkill === 'function') openSkill(res.name);
+  } catch (e) {
+    _skillRecFail(e.message || t('rec_save_failed'));
+  }
+}
+
+async function dismissSkillRecording() {
+  const st = _skillRecState;
+  _skillRecState = null;
+  if (st && st.jobId) {
+    try {
+      await api('/api/skills/record/cancel', {
+        method: 'POST', body: JSON.stringify({ job_id: st.jobId }) });
+    } catch (_) { /* the job expires with its TTL — no need to bother the user */ }
+  } else if (st) {
+    _skillRecState = st;
+    _skillRecStopTracks();
+    _skillRecState = null;
+  }
+  if (typeof cancelSkillForm === 'function') cancelSkillForm();
 }
