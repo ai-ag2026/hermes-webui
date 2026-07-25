@@ -642,3 +642,126 @@ def test_frontend_strings_are_translatable():
     missing = [key for key in used if f"{key}:" not in english]
     assert not missing, f"ohne englischen Text: {missing}"
 
+
+
+# ── Ausführbarkeit der Schritte (Umbau 25.07.) ───────────────────────────────
+# Der Kern der Nachbesserung: die Synthese soll Schritte liefern, die ein Agent
+# aufrufen kann — nicht Prosa. Der Prompt allein garantiert das nicht, deshalb
+# prüft der Validator, und deshalb prüfen diese Tests den Validator.
+
+def test_steps_survive_a_clean_answer():
+    steps, warnings = sr.validate_steps([
+        {"n": 1, "intent": "Board öffnen", "tool": "click",
+         "target": {"role": "button", "name": "Kanban"},
+         "checkpoint": "Fenstertitel enthält 'Kanban'"},
+    ])
+    assert len(steps) == 1 and not warnings
+    assert steps[0]["tool"] == "click"
+    assert steps[0]["target"] == {"role": "button", "name": "Kanban"}
+
+
+def test_unknown_tool_becomes_manual_instead_of_being_dropped():
+    """Ein erfundenes Werkzeug darf nicht still verschwinden — sonst sieht der
+    Entwurf vollständiger aus, als er ist."""
+    steps, warnings = sr.validate_steps([
+        {"tool": "telepathie", "intent": "irgendwas", "checkpoint": "x"}])
+    assert steps[0]["tool"] == "manual"
+    assert any("nicht aufrufbar" in w for w in warnings)
+
+
+def test_element_index_is_stripped():
+    """element_index gilt nur in der Aufnahmesitzung und wäre später falsch."""
+    steps, warnings = sr.validate_steps([
+        {"tool": "click", "intent": "x", "checkpoint": "y",
+         "target": {"element_index": 7, "role": "button", "name": "OK"}}])
+    assert "element_index" not in steps[0]["target"]
+    assert steps[0]["target"] == {"role": "button", "name": "OK"}
+    assert any("element_index" in w for w in warnings)
+
+
+def test_click_without_a_target_is_downgraded():
+    steps, warnings = sr.validate_steps([
+        {"tool": "click", "intent": "irgendwohin klicken", "checkpoint": "x"}])
+    assert steps[0]["tool"] == "manual"
+    assert any("kein benennbares Ziel" in w for w in warnings)
+
+
+def test_coordinate_only_target_is_flagged_but_kept():
+    """Koordinaten sind erlaubt, aber sie brechen bei anderer Auflösung."""
+    steps, warnings = sr.validate_steps([
+        {"tool": "click", "intent": "x", "checkpoint": "y",
+         "target": {"x": 100, "y": 200}}])
+    assert steps[0]["tool"] == "click"
+    assert any("nur Koordinaten" in w for w in warnings)
+
+
+def test_missing_checkpoint_is_flagged():
+    steps, warnings = sr.validate_steps([
+        {"tool": "type_text", "intent": "Titel eintragen", "value": "Test"}])
+    assert steps[0]["checkpoint"] is None
+    assert any("Checkpoint" in w for w in warnings)
+
+
+def test_answer_without_steps_says_so():
+    steps, warnings = sr.validate_steps(None)
+    assert steps == []
+    assert any("keine ausführbaren Schritte" in w for w in warnings)
+
+
+def test_purely_manual_plan_is_called_out():
+    steps, warnings = sr.validate_steps([
+        {"tool": "manual", "intent": "Hand anlegen"},
+        {"tool": "manual", "intent": "noch mehr Hand"}])
+    assert len(steps) == 2
+    assert any("Kein einziger Schritt ist automatisch ausführbar" in w for w in warnings)
+
+
+@pytest.mark.parametrize("text,label", [
+    ("Das Passwort: geheim123 eintragen", "Passwort"),
+    ("api_key = sk-abcdef123456", "API-Key"),
+    ("token: ghp_xxxxxxxxxxxx", "Token"),
+])
+def test_secret_scan_catches_credentials(text, label):
+    assert sr.scan_for_secrets(text), f"{label} nicht erkannt"
+
+
+def test_secret_scan_catches_private_paths():
+    findings = sr.scan_for_secrets("Datei liegt unter /home/manfred/projekt/x.md")
+    assert any("Benutzernamen" in f for f in findings)
+
+
+def test_secret_scan_is_quiet_on_clean_text():
+    assert sr.scan_for_secrets("Öffne das Board und lege eine Karte an.") == []
+
+
+def test_steps_are_appended_to_the_skill_md():
+    md = "---\nname: x\ndescription: y\n---\n\n# Titel\n\n## Ablauf\n1. Klicken\n"
+    out = sr.render_with_steps(md, [{"n": 1, "tool": "click", "intent": "x"}])
+    assert "## Schritte (maschinenlesbar)" in out
+    assert '"tool": "click"' in out
+    # Zweimal anhängen darf den Block nicht verdoppeln.
+    assert sr.render_with_steps(out, [{"n": 1, "tool": "click"}]).count(
+        "## Schritte (maschinenlesbar)") == 1
+
+
+def test_draft_without_steps_stays_plain():
+    md = "---\nname: x\ndescription: y\n---\n\nText\n"
+    assert sr.render_with_steps(md, []) == md
+
+
+def test_parse_synthesis_carries_steps_through():
+    raw = json.dumps({
+        "skill_md": "---\nname: x\ndescription: y\n---\n\nBody",
+        "steps": [{"tool": "type_text", "intent": "tippen", "value": "hallo",
+                   "checkpoint": "Feld enthält 'hallo'"}],
+        "confidence": 0.7})
+    result = sr.parse_synthesis(raw)
+    assert len(result.steps) == 1
+    assert result.steps[0]["value"] == "hallo"
+
+
+def test_prompt_forbids_element_index_and_demands_checkpoints():
+    text = sr.load_prompt()
+    assert "element_index" in text and "verboten" in text
+    assert "verified: false" in text, "der Prompt muss den False-Green-Fall benennen"
+    assert "manual" in text

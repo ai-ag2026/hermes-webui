@@ -160,6 +160,8 @@ class Job:
     duration_s: float | None = None
     frames_used: int | None = None
     saved_path: str | None = None
+    steps: list[dict] = field(default_factory=list)
+    executable_steps: int = 0
 
     def public(self) -> dict:
         """Was der Besitzer sehen darf — ohne interne Pfade."""
@@ -698,6 +700,137 @@ class Synthesis:
     confidence: float
     similar: list[str]
     limitations: list[str]
+    steps: list[dict] = field(default_factory=list)
+    step_warnings: list[str] = field(default_factory=list)
+
+
+# Werkzeuge, die ein Agent später wirklich aufrufen kann. `manual` ist die
+# ehrliche Ausnahme für Schritte, die ein Mensch tun muss — besser als ein
+# erfundener Klick.
+ALLOWED_STEP_TOOLS = frozenset({
+    "bring_to_front", "click", "double_click", "right_click", "type_text",
+    "press_key", "scroll", "set_value", "wait", "shell", "manual",
+})
+# Zielarten in der Reihenfolge ihrer Haltbarkeit. Ein Ziel aus Rolle+Name
+# überlebt eine spätere Sitzung, Koordinaten nicht.
+_TARGET_KEYS = ("role", "name", "near_text", "window", "hint", "x", "y", "command")
+_SECRET_RE = re.compile(
+    r"(?i)\b(pass(?:wor[dt])?|kennwort|secret|token|api[_-]?key|bearer)\b\s*[:=]?\s*\S{3,}")
+_PRIVATE_PATH_RE = re.compile(r"/home/[a-z0-9_.-]+/")
+
+
+def validate_steps(steps: Any) -> tuple[list[dict], list[str]]:
+    """Schritte gegen den Ausführbarkeits-Vertrag prüfen.
+
+    Gibt (brauchbare Schritte, Warnungen) zurück. Ein unbrauchbarer Schritt
+    wird **nicht** stillschweigend geschluckt: er wird zu `manual` degradiert
+    und die Warnung landet sichtbar auf der Entwurfskarte. Ein Skill mit drei
+    ausführbaren und zwei ehrlich markierten Schritten ist mehr wert als fünf
+    erfundene.
+    """
+    warnings: list[str] = []
+    if not isinstance(steps, list) or not steps:
+        return [], ["Das Modell hat keine ausführbaren Schritte geliefert — "
+                    "der Entwurf ist reine Beschreibung."]
+
+    cleaned: list[dict] = []
+    for index, raw in enumerate(steps[:100], start=1):
+        if not isinstance(raw, dict):
+            warnings.append(f"Schritt {index} ist kein Objekt und wurde verworfen.")
+            continue
+        step: dict[str, Any] = {"n": index}
+        tool = str(raw.get("tool") or "").strip()
+        if tool not in ALLOWED_STEP_TOOLS:
+            warnings.append(
+                f"Schritt {index}: Werkzeug {tool or '(fehlt)'!r} ist nicht aufrufbar "
+                f"— als manueller Schritt übernommen.")
+            tool = "manual"
+        step["tool"] = tool
+        step["intent"] = str(raw.get("intent") or "").strip() or f"Schritt {index}"
+
+        target = raw.get("target")
+        target = target if isinstance(target, dict) else {}
+        if "element_index" in target:
+            # Element-Indizes gelten nur innerhalb einer Momentaufnahme.
+            target.pop("element_index", None)
+            warnings.append(
+                f"Schritt {index}: element_index entfernt — gilt nur in der "
+                f"Aufnahmesitzung und wäre später falsch.")
+        step["target"] = {k: target[k] for k in _TARGET_KEYS if k in target}
+
+        needs_target = tool in {"click", "double_click", "right_click",
+                                "set_value", "bring_to_front", "scroll"}
+        if needs_target and not step["target"]:
+            warnings.append(
+                f"Schritt {index}: kein benennbares Ziel — als manueller Schritt "
+                f"übernommen.")
+            step["tool"] = "manual"
+        elif step["target"] and set(step["target"]) <= {"x", "y"}:
+            warnings.append(
+                f"Schritt {index}: nur Koordinaten als Ziel — bricht, sobald sich "
+                f"Fenstergröße oder Auflösung ändern.")
+
+        value = raw.get("value")
+        step["value"] = str(value) if value is not None else None
+        checkpoint = raw.get("checkpoint")
+        step["checkpoint"] = str(checkpoint).strip() if checkpoint else None
+        if step["checkpoint"] is None and step["tool"] != "manual":
+            warnings.append(
+                f"Schritt {index}: kein überprüfbarer Checkpoint — der Erfolg lässt "
+                f"sich später nicht feststellen.")
+        step["failure_signals"] = [str(s) for s in (raw.get("failure_signals") or [])][:5]
+        step["decision_gate"] = bool(raw.get("decision_gate"))
+        step["external_effect"] = bool(raw.get("external_effect"))
+        note = raw.get("note")
+        if note:
+            step["note"] = str(note)[:300]
+        cleaned.append(step)
+
+    executable = sum(1 for s in cleaned if s["tool"] != "manual")
+    if cleaned and executable == 0:
+        warnings.append("Kein einziger Schritt ist automatisch ausführbar — der "
+                        "Entwurf ist eine Anleitung für Menschen.")
+    return cleaned, warnings
+
+
+_STEPS_HEADING = "## Schritte (maschinenlesbar)"
+
+
+def render_with_steps(skill_md: str, steps: list[dict]) -> str:
+    """Die ausführbaren Schritte an die SKILL.md anhängen.
+
+    Sie stehen als JSON-Block in derselben Datei statt in einer Nebendatei: ein
+    Skill ist in Hermes eine Anleitung, die der Agent liest — der Ablauf in
+    Prosa erklärt das Warum, dieser Block macht ihn ausführbar. Ohne Schritte
+    wird nichts angehängt; ein Entwurf ohne Automatik soll auch so aussehen.
+    """
+    if not steps:
+        return skill_md
+    body = skill_md.rstrip()
+    if _STEPS_HEADING in body:
+        return body + "\n"
+    block = json.dumps(steps, ensure_ascii=False, indent=2)
+    return (f"{body}\n\n{_STEPS_HEADING}\n\n"
+            f"Jeder Schritt nennt Werkzeug, Ziel und den Zustand, an dem sich der\n"
+            f"Erfolg erkennen lässt. Eine Erfolgsmeldung des Werkzeugs allein ist\n"
+            f"kein Nachweis.\n\n```json\n{block}\n```\n")
+
+
+def scan_for_secrets(text: str) -> list[str]:
+    """Geheimnisse und private Pfade im Entwurf finden.
+
+    Eine Bildschirmaufnahme sieht alles, was auf dem Schirm stand. Der Prompt
+    verbietet die Übernahme — verlassen wird sich darauf nicht.
+    """
+    findings: list[str] = []
+    if _SECRET_RE.search(text or ""):
+        findings.append(
+            "Der Entwurf enthält etwas, das nach Zugangsdaten aussieht — vor dem "
+            "Speichern prüfen und durch einen Platzhalter ersetzen.")
+    if _PRIVATE_PATH_RE.search(text or ""):
+        findings.append(
+            "Der Entwurf enthält absolute Pfade mit Benutzernamen — besser `~/`.")
+    return findings
 
 
 def parse_synthesis(raw: str) -> Synthesis:
@@ -730,11 +863,15 @@ def parse_synthesis(raw: str) -> Synthesis:
         confidence = float(data.get("confidence", 0.0))
     except (TypeError, ValueError):
         confidence = 0.0
+    steps, step_warnings = validate_steps(data.get("steps"))
+    step_warnings.extend(scan_for_secrets(skill_md))
     return Synthesis(
         skill_md=skill_md,
         confidence=max(0.0, min(1.0, confidence)),
         similar=[str(x) for x in (data.get("similar_skill_candidates") or [])][:10],
         limitations=[str(x) for x in (data.get("limitations") or [])][:20],
+        steps=steps,
+        step_warnings=step_warnings,
     )
 
 
@@ -843,10 +980,15 @@ def run_pipeline(job: Job, conf: dict, *,
             if error:
                 raise RecordingError(f"Entwurf blieb ungültig: {error}", 502)
 
-        job.draft_md = result.skill_md
+        job.draft_md = render_with_steps(result.skill_md, result.steps)
         job.confidence = result.confidence
         job.limitations = result.limitations
         job.similar = _similar_skills(result.skill_md, result.similar, skill_names())
+        job.steps = result.steps
+        job.executable_steps = sum(1 for s in result.steps if s.get("tool") != "manual")
+        # Die Warnungen des Schritt-Validators gehören auf die Karte, nicht ins
+        # Log: sie sagen dem Menschen, wo der Entwurf nicht trägt.
+        job.notes.extend(result.step_warnings)
         job.state = "ready"
         return job
     except RecordingError as exc:

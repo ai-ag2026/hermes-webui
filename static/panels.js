@@ -13916,9 +13916,14 @@ function _renderSkillRecDraft(job) {
   const limitations = (job.limitations || []).map(l => `<li>${esc(l)}</li>`).join('');
   const similar = (job.similar || []).map(s => `<code>${esc(s)}</code>`).join(' ');
   const notes = (job.notes || []).map(n => `<li>${esc(n)}</li>`).join('');
+  const stepCount = (job.steps || []).length;
   const meta = [
     t('rec_draft_header'),
     conf == null ? null : t('rec_confidence', conf),
+    // Der ehrlichste Wert auf der Karte: wie viel davon ein Agent wirklich
+    // ausführen kann. Ein Entwurf aus lauter manuellen Schritten ist eine
+    // Anleitung, keine Automatik — das soll man sehen, bevor man speichert.
+    stepCount ? t('rec_steps', job.executable_steps || 0, stepCount) : null,
     job.frames_used ? t('rec_frames', job.frames_used) : null,
     job.duration_s ? t('rec_duration', _fmtClock(job.duration_s)) : null,
   ].filter(Boolean).join(' · ');
