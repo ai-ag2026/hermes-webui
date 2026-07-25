@@ -276,8 +276,16 @@ def test_frame_selection_is_monotonic_and_bounded():
 
 
 def test_frame_selection_survives_a_video_without_scene_changes():
+    """Ohne Szenenwechsel wird gleichmäßig abgetastet — nicht aufgegeben.
+
+    Diese Zusicherung lautete bis zum 25.07. `== [0.0]` und hat damit den Fehler
+    als Sollverhalten festgeschrieben: ein einziges Bild aus einer 5-Minuten-
+    Aufnahme. Der Durchstich mit einer echten (und damit statischen) Aufnahme
+    hat es aufgedeckt.
+    """
     picked = sr.pick_frames([], 300.0, max_frames=24, min_interval_s=0.5)
-    assert [f.t for f in picked] == [0.0]
+    assert len(picked) == 24
+    assert picked[-1].t > 0.9 * 300.0
 
 
 @needs_ffmpeg
@@ -765,3 +773,55 @@ def test_prompt_forbids_element_index_and_demands_checkpoints():
     assert "element_index" in text and "verboten" in text
     assert "verified: false" in text, "der Prompt muss den False-Green-Fall benennen"
     assert "manual" in text
+
+
+@needs_ffmpeg
+def test_extracted_audio_is_accepted_by_the_real_stt_validator(tmp_path):
+    """REGRESSION (Durchstich 25.07.): die Pipeline schrieb `audio.opus`.
+
+    `transcribe_audio` prüft die Dateiendung gegen eine Positivliste, in der
+    `.opus` fehlt — die Transkription scheiterte am Namen, nicht am Inhalt. Die
+    Unit-Tests sahen es nicht, weil sie den Transkriber injizieren. Deshalb
+    prüft dieser Test gegen den ECHTEN Validator der STT.
+    """
+    video = make_fixture(tmp_path / "ton.webm")
+    out = tmp_path / "audio.webm"
+    sr.extract_audio(video, out)
+    assert out.exists() and out.stat().st_size > 0
+
+    try:
+        from tools.transcription_tools import _validate_audio_file
+    except Exception:
+        pytest.skip("Agent-Checkout nicht im Pfad")
+    assert _validate_audio_file(str(out)) is None, "STT lehnt die Endung ab"
+
+
+def test_pipeline_writes_audio_as_webm():
+    """Die Endung ist Vertrag, nicht Geschmack — im Quelltext festgehalten."""
+    src = Path(sr.__file__).read_text(encoding="utf-8")
+    assert 'directory / "audio.webm"' in src
+    assert 'directory / "audio.opus"' not in src
+
+
+def test_static_recording_still_yields_full_coverage():
+    """REGRESSION (Durchstich 25.07.): echte Screencasts haben KEINE Szenenwechsel.
+
+    28 s Texteditor-Bedienung ergaben null Kandidaten über der Schwelle. Die
+    frühere Fassung übersprang leere Zeitfenster und lieferte genau ein Bild —
+    die Synthese schrieb daraus trotzdem einen Entwurf und meldete `ready`.
+    Ohne Kandidaten muss gleichmäßig abgetastet werden.
+    """
+    picked = sr.pick_frames([], duration=28.0, max_frames=24, min_interval_s=0.5)
+    assert len(picked) == 24, f"nur {len(picked)} Bilder aus einer statischen Aufnahme"
+    assert picked[0].t == 0.0
+    assert picked[-1].t > 0.9 * 28.0
+    # Der erste Abstand ist kürzer, weil t=0 immer gesetzt wird; ab da gleichmäßig.
+    gaps = [b.t - a.t for a, b in zip(picked[1:], picked[2:])]
+    assert max(gaps) - min(gaps) < 0.01, "Abtastung ist nicht gleichmäßig"
+
+
+def test_scene_scores_still_win_inside_a_window():
+    """Wo es Szenenwechsel gibt, sollen sie weiterhin die Auswahl bestimmen."""
+    candidates = [(5.0, 0.2), (6.0, 0.9), (7.0, 0.3)]
+    picked = sr.pick_frames(candidates, duration=10.0, max_frames=3, min_interval_s=0.5)
+    assert 6.0 in [round(f.t, 3) for f in picked], "bester Score im Fenster nicht gewählt"

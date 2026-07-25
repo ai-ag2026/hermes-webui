@@ -537,11 +537,16 @@ def _parse_fps(stream: dict) -> float:
 
 
 def extract_audio(video: Path, out: Path) -> None:
-    """Tonspur als Opus-Mono herausziehen.
+    """Tonspur als Opus-Mono im WebM-Container herausziehen.
 
     Pflichtschritt, nicht Bequemlichkeit: ``transcribe_audio`` akzeptiert zwar
     ``.webm``, lehnt aber alles über 25 MB ab — die Rohaufnahme liegt darüber.
     64 kbit/s Mono ergeben für zehn Minuten etwa 4,8 MB.
+
+    ``out`` muss auf ``.webm`` enden. ``transcribe_audio`` prüft die Endung
+    gegen eine Positivliste ohne ``.opus``; ein Durchstich mit echter STT hat
+    das am 25.07. aufgedeckt, nachdem die Unit-Tests es mit injiziertem
+    Transkriber jahrelang verdeckt hätten.
     """
     proc = _run(["ffmpeg", "-y", "-v", "error", "-i", str(video), "-vn", "-ac", "1",
                  "-c:a", "libopus", "-b:a", "64k", str(out)], FFMPEG_TIMEOUT_S)
@@ -585,10 +590,18 @@ def scene_candidates(video: Path, threshold: float) -> list[tuple[float, float]]
 
 def pick_frames(candidates: list[tuple[float, float]], duration: float,
                 max_frames: int, min_interval_s: float) -> list[Frame]:
-    """Ein Bild je Zeitfenster, jeweils das mit dem höchsten Szenen-Score.
+    """Ein Bild je Zeitfenster — Szenen-Score wählt nur aus, er entscheidet nicht.
 
-    Die Fenstereinteilung ist der Grund, warum überhaupt zwei Durchgänge nötig
-    sind: sie garantiert Abdeckung über die volle Laufzeit statt nur am Anfang.
+    Die Fenstereinteilung garantiert Abdeckung über die volle Laufzeit statt
+    nur am Anfang. Findet ein Fenster keinen Szenenwechsel, wird trotzdem seine
+    Mitte genommen.
+
+    Das ist nicht theoretisch: eine echte Bildschirmaufnahme ist überwiegend
+    statisch. Der Durchstich am 25.07. — 28 s Texteditor-Bedienung — enthielt
+    **null** Szenenwechsel über der Schwelle. Die frühere Fassung übersprang
+    leere Fenster und lieferte deshalb genau ein Bild; die Synthese schrieb
+    daraus einen Entwurf und meldete `ready`. Das synthetische Fixture mit
+    harten Farbschnitten hatte den Fall verdeckt.
     """
     picked = [Frame(t=0.0, score=1.0)]
     if max_frames <= 1 or duration <= 0:
@@ -598,9 +611,10 @@ def pick_frames(candidates: list[tuple[float, float]], duration: float,
     for i in range(slots):
         low, high = i * width, (i + 1) * width
         window = [c for c in candidates if low <= c[0] < high]
-        if not window:
-            continue
-        t, score = max(window, key=lambda c: c[1])
+        if window:
+            t, score = max(window, key=lambda c: c[1])
+        else:
+            t, score = low + width / 2, 0.0     # gleichmäßige Stichprobe
         if t - picked[-1].t < min_interval_s:
             continue
         picked.append(Frame(t=t, score=score))
@@ -924,7 +938,10 @@ def run_pipeline(job: Job, conf: dict, *,
 
     directory = job_dir(job.job_id, conf)
     video = directory / "recording.webm"
-    audio = directory / "audio.opus"
+    # .webm, nicht .opus: transcribe_audio prüft die Dateiendung gegen eine
+    # Positivliste, in der `.opus` NICHT steht. Opus im WebM-Container ist
+    # dieselbe Tonspur unter einem Namen, den die STT annimmt.
+    audio = directory / "audio.webm"
     keyframes = conf.get("keyframes", {})
     try:
         job.state = "probing"
