@@ -1081,6 +1081,13 @@ def _hermes_root() -> Path:
     return _root_skills_dir().parent
 
 
+def _current_umask() -> int:
+    """Aktuelle umask lesen, ohne sie bleibend zu verändern."""
+    value = os.umask(0o022)
+    os.umask(value)
+    return value
+
+
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
 
 
@@ -1179,6 +1186,10 @@ def commit_skill(content: str, name: str, category: str = "") -> dict:
         fd, tmp_name = tempfile.mkstemp(dir=str(target_dir), suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(content)
+        # mkstemp legt mit 0600 an. Ein Skill ist eine Anleitung, keine
+        # Geheimnisdatei — Rechte wie bei einem normalen Write, damit er sich
+        # nicht vom übrigen Katalog unterscheidet.
+        os.chmod(tmp_name, 0o644 & ~_current_umask())
         Path(tmp_name).replace(skill_md)
 
         scan_error = _security_scan(target_dir)

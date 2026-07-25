@@ -825,3 +825,12 @@ def test_scene_scores_still_win_inside_a_window():
     candidates = [(5.0, 0.2), (6.0, 0.9), (7.0, 0.3)]
     picked = sr.pick_frames(candidates, duration=10.0, max_frames=3, min_interval_s=0.5)
     assert 6.0 in [round(f.t, 3) for f in picked], "bester Score im Fenster nicht gewählt"
+
+
+def test_saved_skill_is_readable_like_the_rest_of_the_catalog(fake_root):
+    """mkstemp legt mit 0600 an — ein Skill soll wie eine normale Datei liegen."""
+    root, _ = fake_root
+    sr.commit_skill(VALID_SKILL, "rechte-test")
+    written = root / "skills" / "rechte-test" / "SKILL.md"
+    mode = written.stat().st_mode & 0o777
+    assert mode & 0o044, f"Skill ist nur für den Besitzer lesbar (mode {mode:o})"
