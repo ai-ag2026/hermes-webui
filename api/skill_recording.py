@@ -733,6 +733,42 @@ _SECRET_RE = re.compile(
 _PRIVATE_PATH_RE = re.compile(r"/home/[a-z0-9_.-]+/")
 
 
+# Formen, die der Runner ohne Sprachmodell entscheiden kann. Jede andere Angabe
+# wird verworfen: eine Behauptung, die niemand prüfen kann, ist schlimmer als
+# keine — der Runner glaubt ihr ohne Rückfrage.
+_PRUEFUNG_ARTEN = {
+    "fenster_offen": ("wert",),
+    "fenster_zu": ("wert",),
+    "fenster_fokus": ("wert",),
+    "text_endet_mit": ("wert",),
+    "datei_endet_mit": ("wert", "pfad"),
+}
+
+
+def _validate_pruefung(roh: Any, index: int, warnings: list[str]) -> dict | None:
+    """Die maschinenlesbare Behauptung eines Schritts prüfen — oder verwerfen."""
+    if roh is None:
+        return None
+    if not isinstance(roh, dict):
+        warnings.append(f"Schritt {index}: `pruefung` ist kein Objekt und wurde "
+                        f"verworfen.")
+        return None
+    art = str(roh.get("art") or "").strip()
+    if art not in _PRUEFUNG_ARTEN:
+        warnings.append(f"Schritt {index}: unbekannte Prüfart {art or '(fehlt)'!r} "
+                        f"— verworfen, der Checkpoint bleibt Prosa.")
+        return None
+    fehlend = [f for f in _PRUEFUNG_ARTEN[art] if not str(roh.get(f) or "").strip()]
+    if fehlend:
+        warnings.append(f"Schritt {index}: Prüfung {art!r} ohne "
+                        f"{', '.join(fehlend)} — verworfen.")
+        return None
+    geprueft = {"art": art, "wert": str(roh["wert"])}
+    if "pfad" in _PRUEFUNG_ARTEN[art]:
+        geprueft["pfad"] = str(roh["pfad"])
+    return geprueft
+
+
 def validate_steps(steps: Any) -> tuple[list[dict], list[str]]:
     """Schritte gegen den Ausführbarkeits-Vertrag prüfen.
 
@@ -792,6 +828,7 @@ def validate_steps(steps: Any) -> tuple[list[dict], list[str]]:
             warnings.append(
                 f"Schritt {index}: kein überprüfbarer Checkpoint — der Erfolg lässt "
                 f"sich später nicht feststellen.")
+        step["pruefung"] = _validate_pruefung(raw.get("pruefung"), index, warnings)
         step["failure_signals"] = [str(s) for s in (raw.get("failure_signals") or [])][:5]
         step["decision_gate"] = bool(raw.get("decision_gate"))
         step["external_effect"] = bool(raw.get("external_effect"))

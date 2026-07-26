@@ -63,6 +63,29 @@ eine Datei existiert.
 Kannst du für einen Schritt keinen Checkpoint angeben, schreibe
 `"checkpoint": null` — und nenne unter `limitations`, warum.
 
+### Prüfbar statt nur beschrieben
+
+Hat der Checkpoint eine der folgenden Formen, gib ihn **zusätzlich**
+maschinenlesbar als `pruefung` an. Der Runner entscheidet ihn dann direkt gegen
+den Zustand — in Mikrosekunden statt über ein Sprachmodell, und ohne die
+Möglichkeit eines Fehlurteils:
+
+| Wenn der Checkpoint sagt … | dann `pruefung` |
+|---|---|
+| ein Fenster ist offen | `{"art": "fenster_offen", "wert": "<Titel>"}` |
+| ein Fenster ist weg | `{"art": "fenster_zu", "wert": "<Titel>"}` |
+| ein Fenster hat den Fokus | `{"art": "fenster_fokus", "wert": "<Titel>"}` |
+| ein Textbereich endet mit … | `{"art": "text_endet_mit", "wert": "<Text>"}` |
+| eine Datei endet mit … | `{"art": "datei_endet_mit", "pfad": "<Pfad>", "wert": "<Text>"}` |
+
+Für `text_endet_mit` und `datei_endet_mit` schreibst du einen Zeilenumbruch als
+`\n` — ob etwas in einer **neuen Zeile** steht oder an die alte angehängt wurde,
+ist oft die eigentliche Aussage.
+
+Trifft keine Form zu, lass `pruefung` weg. **Erfinde nichts**: der Wert muss
+genau das sein, was in der Aufnahme zu sehen ist. Ein falsches `pruefung` ist
+schlimmer als keines, weil der Runner ihm ohne Rückfrage glaubt.
+
 ## Was die Aufnahme nicht hergibt
 
 Erfinde nichts. Ein Schritt, dessen Ziel du nicht benennen kannst, bekommt
@@ -106,6 +129,7 @@ Code-Zaun. Sprache von `skill_md` und Beschreibungen: die der Narration.
     "target": {"role": "button", "name": "Neue Karte"},
     "value": "<Text bei type_text/set_value, sonst null>",
     "checkpoint": "<beobachtbarer Zustand danach, oder null>",
+    "pruefung": {"art": "text_endet_mit", "wert": "…"},
     "failure_signals": ["<woran man erkennt, dass es schiefging>"],
     "decision_gate": false,
     "external_effect": false,

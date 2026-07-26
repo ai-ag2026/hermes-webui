@@ -834,3 +834,61 @@ def test_saved_skill_is_readable_like_the_rest_of_the_catalog(fake_root):
     written = root / "skills" / "rechte-test" / "SKILL.md"
     mode = written.stat().st_mode & 0o777
     assert mode & 0o044, f"Skill ist nur für den Besitzer lesbar (mode {mode:o})"
+
+
+# ── Maschinenlesbare Prüfungen ───────────────────────────────────────────────
+#
+# Der Runner entscheidet eine `pruefung` ohne Sprachmodell und ohne Rückfrage.
+# Genau deshalb darf hier nichts durchrutschen, was er nicht prüfen kann: eine
+# falsche Behauptung wäre schlimmer als gar keine.
+
+def test_pruefung_bekannter_art_wird_uebernommen():
+    steps, warnungen = sr.validate_steps([{
+        "tool": "type_text", "intent": "tippen", "target": {"window": "Editor"},
+        "value": "Hallo", "checkpoint": "Der Textbereich endet mit „Hallo“.",
+        "pruefung": {"art": "text_endet_mit", "wert": "Hallo"},
+    }])
+    assert steps[0]["pruefung"] == {"art": "text_endet_mit", "wert": "Hallo"}
+    assert not [w for w in warnungen if "Prüf" in w]
+
+
+def test_dateipruefung_braucht_einen_pfad():
+    steps, warnungen = sr.validate_steps([{
+        "tool": "press_key", "intent": "speichern", "target": {"window": "Editor"},
+        "checkpoint": "Die Datei endet mit „Hallo“.",
+        "pruefung": {"art": "datei_endet_mit", "wert": "Hallo"},   # Pfad fehlt
+    }])
+    assert steps[0]["pruefung"] is None
+    assert any("pfad" in w for w in warnungen)
+
+
+def test_dateipruefung_mit_pfad_bleibt_erhalten():
+    steps, _ = sr.validate_steps([{
+        "tool": "press_key", "intent": "speichern", "target": {"window": "Editor"},
+        "checkpoint": "Die Datei endet mit „Hallo“.",
+        "pruefung": {"art": "datei_endet_mit", "wert": "Hallo",
+                     "pfad": "/tmp/x.txt"},
+    }])
+    assert steps[0]["pruefung"]["pfad"] == "/tmp/x.txt"
+
+
+def test_erfundene_pruefart_wird_verworfen_nicht_uebernommen():
+    steps, warnungen = sr.validate_steps([{
+        "tool": "click", "intent": "klicken", "target": {"role": "button", "name": "OK"},
+        "checkpoint": "Der Knopf leuchtet grün.",
+        "pruefung": {"art": "knopf_leuchtet", "wert": "gruen"},
+    }])
+    assert steps[0]["pruefung"] is None, "unbekannte Prüfart darf nicht durchrutschen"
+    assert any("Prüfart" in w for w in warnungen)
+    # Der Schritt selbst bleibt brauchbar — nur die Behauptung fällt weg.
+    assert steps[0]["tool"] == "click"
+    assert steps[0]["checkpoint"] == "Der Knopf leuchtet grün."
+
+
+def test_ohne_pruefung_bleibt_der_schritt_unveraendert():
+    steps, _ = sr.validate_steps([{
+        "tool": "click", "intent": "klicken",
+        "target": {"role": "button", "name": "OK"},
+        "checkpoint": "Ein Dialog ist offen.",
+    }])
+    assert steps[0]["pruefung"] is None
