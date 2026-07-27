@@ -21,8 +21,12 @@ outcome), which a passive UI ping could not.
 Delivery contract:
   - The subscription cursor is the durable queue. Claim advances it; any
     delivery failure rewinds it (CAS-guarded), so events survive process
-    restarts. A crash between claim and turn-start loses that batch — the same
-    documented trade-off the gateway notifier makes.
+    restarts. A graceful stop rewinds claims that were taken but not yet
+    delivered (``_rewind_inflight``); only a hard kill between claim and
+    turn-start can still lose a batch. Giving up on a channel (session gone,
+    repeated turn-start failures) rewinds too and records a
+    ``notify_delivery_failed`` event on the task, so an undelivered result is
+    visible instead of silently consumed.
   - One turn per session per tick: all deliverable events for a session are
     batched into a single wakeup prompt, so parallel claims cannot race each
     other into 409s.
@@ -265,6 +269,39 @@ def _start_turn(session_id: str, message: str) -> dict:
     return start_session_turn(session_id, message, source="process_wakeup")
 
 
+def _dead_letter(kb, conn, claim: dict, reason: str) -> None:
+    """Record an undeliverable notification on the task itself.
+
+    Dropping a subscription (session deleted, repeated turn-start failures)
+    silently consumed the task's terminal events: nothing in the board, the
+    event log or `hermes kanban audit` showed that a result was never
+    delivered — the exact invisibility the 2026-07-27 incident was about
+    (TARS review, P1). The marker is durable and shows up in kanban_show.
+    """
+    sub = claim["sub"]
+    payload = {
+        "platform": sub.get("platform"),
+        "chat_id": sub.get("chat_id"),
+        "reason": reason,
+        "event_ids": [getattr(e, "id", None) for e in claim.get("events") or []],
+    }
+    try:
+        append = getattr(kb, "_append_event", None)
+        if append is not None:
+            append(conn, sub["task_id"], "notify_delivery_failed", payload)
+            return
+    except Exception:
+        pass
+    try:
+        kb.add_comment(
+            conn, sub["task_id"], author="kanban-notify",
+            body=f"Notification could not be delivered ({reason}): {payload}",
+        )
+    except Exception:
+        logger.warning("kanban notify: could not record dead-letter for %s",
+                       sub.get("task_id"), exc_info=True)
+
+
 def _finalize_claims(kb, claims: list[dict], *, delivered: bool) -> None:
     """Rewind cursors on failure; drop subscriptions of finished tasks on success."""
     by_board: dict[str, list[dict]] = {}
@@ -279,7 +316,7 @@ def _finalize_claims(kb, claims: list[dict], *, delivered: bool) -> None:
                     sub = c["sub"]
                     if not delivered:
                         try:
-                            kb.rewind_notify_cursor(
+                            rewound = kb.rewind_notify_cursor(
                                 conn,
                                 task_id=sub["task_id"],
                                 platform=sub["platform"],
@@ -289,8 +326,20 @@ def _finalize_claims(kb, claims: list[dict], *, delivered: bool) -> None:
                                 old_cursor=c["old_cursor"],
                             )
                         except Exception:
+                            rewound = False
                             logger.warning("kanban notify: rewind failed for %s",
                                            sub.get("task_id"), exc_info=True)
+                        if not rewound:
+                            # CAS refused: another poller advanced this cursor
+                            # after our claim, so our events can never be
+                            # redelivered. Make the loss visible instead of
+                            # dropping it on the floor (TARS review, P1).
+                            logger.warning(
+                                "kanban notify: cursor for %s moved on after our "
+                                "claim — %d event(s) cannot be redelivered",
+                                sub.get("task_id"), len(c.get("events") or []),
+                            )
+                            _dead_letter(kb, conn, c, "rewind_lost_race")
                         continue
                     task = c["task"]
                     if task is not None and getattr(task, "status", None) in ("done", "archived"):
@@ -310,8 +359,14 @@ def _finalize_claims(kb, claims: list[dict], *, delivered: bool) -> None:
                            board, exc_info=True)
 
 
-def _drop_subscriptions(kb, claims: list[dict]) -> None:
-    """Deactivate subscriptions whose destination can never be served."""
+def _drop_subscriptions(kb, claims: list[dict], *, reason: str) -> None:
+    """Deactivate subscriptions whose destination can never be served.
+
+    Always rewinds the claim first: giving up on the CHANNEL must not also
+    consume the task's terminal events, and the loss is recorded on the task
+    so an operator (and `hermes kanban audit`) can see that a finished task's
+    result was never announced.
+    """
     by_board: dict[str, list[dict]] = {}
     for c in claims:
         by_board.setdefault(c["board"], []).append(c)
@@ -322,6 +377,20 @@ def _drop_subscriptions(kb, claims: list[dict]) -> None:
             with _conn(board) as conn:
                 for c in board_claims:
                     sub = c["sub"]
+                    try:
+                        kb.rewind_notify_cursor(
+                            conn,
+                            task_id=sub["task_id"],
+                            platform=sub["platform"],
+                            chat_id=sub["chat_id"],
+                            thread_id=sub.get("thread_id") or None,
+                            claimed_cursor=c["new_cursor"],
+                            old_cursor=c["old_cursor"],
+                        )
+                    except Exception:
+                        logger.debug("kanban notify: rewind-before-drop failed for %s",
+                                     sub.get("task_id"), exc_info=True)
+                    _dead_letter(kb, conn, c, reason)
                     try:
                         kb.remove_notify_sub(
                             conn,
@@ -336,6 +405,28 @@ def _drop_subscriptions(kb, claims: list[dict]) -> None:
         except Exception:
             logger.warning("kanban notify: drop subs failed for board %s",
                            board, exc_info=True)
+
+
+# Claims whose cursor is already advanced but whose delivery has not been
+# finalized yet. Emptied at the end of every tick; drained on shutdown.
+_INFLIGHT_CLAIMS: "list[tuple]" = []
+
+
+def _rewind_inflight() -> int:
+    """Rewind claims that were taken but never finalized. Returns count."""
+    rewound = 0
+    while _INFLIGHT_CLAIMS:
+        kb, claims = _INFLIGHT_CLAIMS.pop()
+        pending = [c for c in claims if not c.get("_finalized")]
+        if not pending:
+            continue
+        try:
+            _finalize_claims(kb, pending, delivered=False)
+            rewound += len(pending)
+        except Exception:
+            logger.warning("kanban notify: could not rewind in-flight claims",
+                           exc_info=True)
+    return rewound
 
 
 def run_tick() -> int:
@@ -355,6 +446,11 @@ def run_tick() -> int:
             logger.warning("kanban notify: board %s tick failed", slug, exc_info=True)
     if not claims:
         return 0
+    # The claim already advanced the durable cursor, so from here until each
+    # claim is finalized the events exist only in memory. Publish them so a
+    # graceful shutdown can rewind instead of swallowing them (TARS review,
+    # P1) — the common case is exactly a WebUI restart mid-tick.
+    _INFLIGHT_CLAIMS.append((kb, claims))
 
     by_session: dict[str, list[dict]] = {}
     for c in claims:
@@ -392,7 +488,7 @@ def run_tick() -> int:
         elif status == 404:
             # Session is gone; the subscription can never deliver. Drop it so
             # the notifier stops claiming for a dead destination.
-            _drop_subscriptions(kb, session_claims)
+            _drop_subscriptions(kb, session_claims, reason="session_not_found")
             logger.info("kanban notify: session %s not found; dropped %d subscription(s)",
                         session_id, len(session_claims))
         elif status == 409 and resp.get("error") == "process_wakeup_paused":
@@ -410,7 +506,9 @@ def run_tick() -> int:
             failures = _FAILURES.get(session_id, 0) + 1
             _FAILURES[session_id] = failures
             if failures >= _MAX_CONSECUTIVE_FAILURES:
-                _drop_subscriptions(kb, session_claims)
+                _drop_subscriptions(
+                    kb, session_claims, reason=f"turn_start_failed_status_{status}",
+                )
                 _FAILURES.pop(session_id, None)
                 _BACKOFF_UNTIL.pop(session_id, None)
                 logger.warning(
@@ -426,6 +524,12 @@ def run_tick() -> int:
                     "(status=%s, attempt %d/%d)",
                     session_id, status, failures, _MAX_CONSECUTIVE_FAILURES,
                 )
+    for c in claims:
+        c["_finalized"] = True
+    try:
+        _INFLIGHT_CLAIMS.remove((kb, claims))
+    except ValueError:
+        pass
     return started
 
 
@@ -470,3 +574,12 @@ def stop_kanban_notify_poller(timeout: float = 2.0) -> None:
     th = _THREAD
     if th is not None and th.is_alive():
         th.join(timeout=timeout)
+    # A tick interrupted by shutdown holds claims whose cursor already moved.
+    # Rewind them so a restart redelivers instead of the events being lost.
+    try:
+        n = _rewind_inflight()
+        if n:
+            logger.info("kanban notify: rewound %d unfinalized claim(s) on shutdown", n)
+    except Exception:
+        logger.warning("kanban notify: in-flight rewind on shutdown failed",
+                       exc_info=True)

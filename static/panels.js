@@ -2511,13 +2511,24 @@ function _kanbanLaneNames(columns){
 
 function _kanbanRenderColumn(col){
   const tasks = col.tasks || [];
+  // The server caps the done column and reports the true size as done_total.
+  // Showing only tasks.length made the board claim a smaller history than it
+  // has, and hid from the operator that search covers just the shipped slice.
+  const serverTotal = (col.name === 'done' && _kanbanBoard && Number.isFinite(Number(_kanbanBoard.done_total)))
+    ? Number(_kanbanBoard.done_total) : null;
+  const capped = serverTotal !== null && serverTotal > tasks.length;
+  const countLabel = capped ? `${tasks.length}/${serverTotal}` : `${tasks.length}`;
+  const capNote = capped
+    ? `<div class="kanban-empty">${esc(t('kanban_done_capped') || `Showing the ${tasks.length} most recent of ${serverTotal} — older cards are not loaded (and not searched).`)}</div>`
+    : '';
   return `<section class="kanban-column" data-status="${esc(col.name)}" data-kanban-status="${esc(col.name)}" ondragover="allowKanbanDrop(event)" ondragenter="event.currentTarget.classList.add('drop-target')" ondragleave="clearKanbanDrop(event)" ondrop="dropKanbanTask(event, '${esc(col.name)}')">
       <div class="kanban-column-head">
         <span>${esc(_kanbanColumnLabel(col.name))}</span>
-        <span class="kanban-count">${tasks.length}</span>
+        <span class="kanban-count"${capped ? ` title="${esc(String(serverTotal))} total"` : ''}>${esc(countLabel)}</span>
       </div>
       <div class="kanban-column-body">
         ${tasks.length ? tasks.map(task => _kanbanCard(task, col.name)).join('') : `<div class="kanban-empty">${esc(t('kanban_empty'))}</div>`}
+        ${capNote}
       </div>
     </section>`;
 }

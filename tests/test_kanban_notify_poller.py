@@ -72,6 +72,12 @@ class FakeKB:
     tasks: dict[str, FakeTask] = field(default_factory=dict)
     rewinds: list[str] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
+    appended_events: list = field(default_factory=list)
+
+    def _append_event(self, conn, task_id, kind, payload):
+        self.appended_events.append(
+            FakeEvent(len(self.appended_events) + 1000, task_id, kind, payload)
+        )
 
     def list_boards(self, *, include_archived=True):
         return [{"slug": "default"}]
@@ -237,7 +243,10 @@ def test_deleted_session_drops_subscription(fake_env):
 
     assert poller.run_tick() == 0
     assert kb.removed == ["t_del"]
-    assert not kb.rewinds                       # no rewind: destination unreachable forever
+    # New contract (TARS review 2026-07-27): giving up on the CHANNEL must not
+    # also consume the task's events — rewind first, then record the loss.
+    assert kb.rewinds == ["t_del"]
+    assert any(e.kind == "notify_delivery_failed" for e in kb.appended_events)
 
 
 def test_paused_wakeups_back_off_long(fake_env):
@@ -270,3 +279,71 @@ def test_repeated_failures_cap_and_drop_subscription(fake_env):
 
     assert kb.removed == ["t_bad"]
     assert len(turns) == poller._MAX_CONSECUTIVE_FAILURES
+
+
+# ---------------------------------------------------------------------------
+# Repair round after the TARS review (2026-07-27)
+# ---------------------------------------------------------------------------
+
+def test_shutdown_rewinds_unfinalized_claims(fake_env, monkeypatch):
+    """A tick interrupted by shutdown must not swallow claimed events.
+
+    The claim advances the durable cursor before the turn starts; without a
+    drain, a WebUI restart mid-tick loses that batch silently.
+    """
+    kb, turns, _ = fake_env
+    sub = FakeSub("t_shut", "sess1")
+    kb.subs.append(sub)
+    kb.tasks["t_shut"] = FakeTask("t_shut", "Shutdown")
+    kb.events.append(FakeEvent(11, "t_shut", "completed"))
+
+    # Simulate an interrupted tick: claim, then stop before finalizing.
+    claims = poller._collect_board_claims(kb, "default")
+    assert claims and sub.last_event_id == 11
+    poller._INFLIGHT_CLAIMS.append((kb, claims))
+    monkeypatch.setattr(poller, "_THREAD", None)
+
+    poller.stop_kanban_notify_poller(timeout=0)
+
+    assert sub.last_event_id == 0, "shutdown must rewind the claimed cursor"
+    assert kb.rewinds == ["t_shut"]
+    assert not poller._INFLIGHT_CLAIMS
+
+
+def test_dropping_subscription_rewinds_and_dead_letters(fake_env):
+    """Giving up on a channel must not consume the task's events silently."""
+    kb, turns, responses = fake_env
+    sub = FakeSub("t_dead", "gone")
+    kb.subs.append(sub)
+    kb.tasks["t_dead"] = FakeTask("t_dead", "Weg")
+    kb.events.append(FakeEvent(3, "t_dead", "completed"))
+    responses.append({"_status": 404, "error": "Session not found"})
+
+    assert poller.run_tick() == 0
+    assert kb.removed == ["t_dead"]
+    # Cursor rewound (events not consumed) and the loss recorded on the task.
+    assert sub.last_event_id == 0 or ("t_dead" in kb.rewinds)
+    assert any(e.kind == "notify_delivery_failed" for e in kb.appended_events), \
+        "an undeliverable notification must leave a durable marker"
+    marker = next(e for e in kb.appended_events if e.kind == "notify_delivery_failed")
+    assert marker.payload["reason"] == "session_not_found"
+
+
+def test_lost_rewind_race_is_dead_lettered(fake_env, monkeypatch):
+    """If another poller moved the cursor on, the loss becomes visible."""
+    kb, turns, responses = fake_env
+    kb.subs.append(FakeSub("t_race", "sess1"))
+    kb.tasks["t_race"] = FakeTask("t_race", "Race")
+    kb.events.append(FakeEvent(4, "t_race", "completed"))
+    responses.append({"_status": 409, "error": "session already has an active stream"})
+
+    real_rewind = kb.rewind_notify_cursor
+    def losing_rewind(*a, **kw):
+        real_rewind(*a, **kw)
+        return False  # CAS refused: a sibling poller advanced past our claim
+    monkeypatch.setattr(kb, "rewind_notify_cursor", losing_rewind)
+
+    poller.run_tick()
+    assert any(e.kind == "notify_delivery_failed"
+               and e.payload["reason"] == "rewind_lost_race"
+               for e in kb.appended_events)
