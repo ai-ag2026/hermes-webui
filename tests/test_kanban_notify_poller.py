@@ -298,16 +298,23 @@ def test_shutdown_rewinds_unfinalized_claims(fake_env, monkeypatch):
     kb.events.append(FakeEvent(11, "t_shut", "completed"))
 
     # Simulate an interrupted tick: claim, then stop before finalizing.
+    # _collect_board_claims registers each claim itself (right after the
+    # cursor CAS), so appending the batch again here would build a
+    # production-impossible double registration (TARS re-review 2026-07-27).
+    poller._INFLIGHT_CLAIMS.clear()
     claims = poller._collect_board_claims(kb, "default")
     assert claims and sub.last_event_id == 11
-    poller._INFLIGHT_CLAIMS.append((kb, claims))
+    assert len(poller._INFLIGHT_CLAIMS) == 1, "claim registers exactly once"
     monkeypatch.setattr(poller, "_THREAD", None)
 
     poller.stop_kanban_notify_poller(timeout=0)
 
     assert sub.last_event_id == 0, "shutdown must rewind the claimed cursor"
-    assert kb.rewinds == ["t_shut"]
+    assert kb.rewinds == ["t_shut"], "rewound exactly once, not twice"
     assert not poller._INFLIGHT_CLAIMS
+    assert not [e for e in kb.appended_events if e.kind == "notify_delivery_failed"], (
+        "a plain shutdown rewind must not dead-letter anything"
+    )
 
 
 def test_dropping_subscription_rewinds_and_dead_letters(fake_env):

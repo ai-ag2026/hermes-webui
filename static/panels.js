@@ -2542,7 +2542,19 @@ function _kanbanRenderColumn(col, opts){
 function _kanbanRenderProfileLanes(columns){
   const lanes = _kanbanLaneNames(columns);
   if (!lanes.length) return columns.map(col => _kanbanRenderColumn(col)).join('');
-  return `<div class="kanban-profile-lanes">${lanes.map(lane => {
+  // Lanes suppress the per-column cap note (their filtered slice must not be
+  // compared against the GLOBAL done_total), but the cap still applies: the
+  // lanes are built from the capped slice and older cards are not searched.
+  // Show it once, above the lanes, instead of hiding it entirely (TARS
+  // re-review 2026-07-27).
+  const doneCol = columns.find(col => col.name === 'done');
+  const shownDone = doneCol ? (doneCol.tasks || []).length : 0;
+  const totalDone = (_kanbanBoard && Number.isFinite(Number(_kanbanBoard.done_total)))
+    ? Number(_kanbanBoard.done_total) : null;
+  const globalCapNote = (totalDone !== null && totalDone > shownDone)
+    ? `<div class="kanban-empty kanban-lane-cap-note">${esc(t('kanban_done_capped', shownDone, totalDone))}</div>`
+    : '';
+  return `<div class="kanban-profile-lanes">${globalCapNote}${lanes.map(lane => {
     const laneCols = columns.map(col => ({...col, tasks: (col.tasks || []).filter(task => _kanbanLaneKey(task) === lane)}));
     const count = laneCols.reduce((sum, col) => sum + (col.tasks || []).length, 0);
     const laneClass = lane === KANBAN_UNASSIGNED_LANE ? ' kanban-profile-lane-unassigned' : '';
