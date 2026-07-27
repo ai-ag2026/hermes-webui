@@ -656,6 +656,13 @@ def main() -> None:
         print(f'[!!] WARNING: bg_task_complete drain failed to start: {e}', flush=True)
 
     try:
+        from api.kanban_notify_poller import start_kanban_notify_poller
+        if start_kanban_notify_poller():
+            print('[ok] kanban notify poller started', flush=True)
+    except Exception as e:
+        print(f'[!!] WARNING: kanban notify poller failed to start: {e}', flush=True)
+
+    try:
         from api.background_process import start_session_channel_reaper
         if start_session_channel_reaper():
             print('[ok] SessionChannel reaper thread started', flush=True)
@@ -740,6 +747,11 @@ def main() -> None:
             stop_drain_thread()
         except Exception:
             logger.debug("Failed to stop bg_task_complete drain thread during shutdown", exc_info=True)
+        try:
+            from api.kanban_notify_poller import stop_kanban_notify_poller
+            stop_kanban_notify_poller()
+        except Exception:
+            logger.debug("Failed to stop kanban notify poller during shutdown", exc_info=True)
         try:
             from api.background_process import stop_session_channel_reaper
             stop_session_channel_reaper()
