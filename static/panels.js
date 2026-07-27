@@ -2522,10 +2522,15 @@ function _kanbanRenderColumn(col, opts){
   const serverTotal = (!suppressCap && col.name === 'done' && _kanbanBoard
       && Number.isFinite(Number(_kanbanBoard.done_total)))
     ? Number(_kanbanBoard.done_total) : null;
-  const capped = serverTotal !== null && serverTotal > tasks.length;
+  // Compare against the LOADED slice, not the currently filtered view.
+  const unfilteredDone = serverTotal === null ? 0 : (() => {
+    const c = (_kanbanBoard.columns || []).find(x => x.name === 'done');
+    return c ? (c.tasks || []).length : 0;
+  })();
+  const capped = serverTotal !== null && serverTotal > unfilteredDone;
   const countLabel = capped ? `${tasks.length}/${serverTotal}` : `${tasks.length}`;
   const capNote = capped
-    ? `<div class="kanban-empty">${esc(t('kanban_done_capped', tasks.length, serverTotal))}</div>`
+    ? `<div class="kanban-empty">${esc(t('kanban_done_capped', unfilteredDone, serverTotal))}</div>`
     : '';
   return `<section class="kanban-column" data-status="${esc(col.name)}" data-kanban-status="${esc(col.name)}" ondragover="allowKanbanDrop(event)" ondragenter="event.currentTarget.classList.add('drop-target')" ondragleave="clearKanbanDrop(event)" ondrop="dropKanbanTask(event, '${esc(col.name)}')">
       <div class="kanban-column-head">
@@ -2539,22 +2544,28 @@ function _kanbanRenderColumn(col, opts){
     </section>`;
 }
 
+function _kanbanCapNoteHtml(){
+  // ALWAYS derived from the UNFILTERED board slice. Using the currently
+  // rendered (search-filtered) count claimed "the 3 most recent of 268" when
+  // 50 were loaded and 3 matched — and the note is exactly what tells the
+  // operator that the search never saw the older cards (TARS re-review 3).
+  if (!_kanbanBoard) return '';
+  const total = Number(_kanbanBoard.done_total);
+  if (!Number.isFinite(total)) return '';
+  const doneCol = (_kanbanBoard.columns || []).find(col => col.name === 'done');
+  const loaded = doneCol ? (doneCol.tasks || []).length : 0;
+  if (total <= loaded) return '';
+  return `<div class="kanban-empty kanban-lane-cap-note">${esc(t('kanban_done_capped', loaded, total))}</div>`;
+}
+
 function _kanbanRenderProfileLanes(columns){
   const lanes = _kanbanLaneNames(columns);
   if (!lanes.length) return columns.map(col => _kanbanRenderColumn(col)).join('');
   // Lanes suppress the per-column cap note (their filtered slice must not be
   // compared against the GLOBAL done_total), but the cap still applies: the
   // lanes are built from the capped slice and older cards are not searched.
-  // Show it once, above the lanes, instead of hiding it entirely (TARS
-  // re-review 2026-07-27).
-  const doneCol = columns.find(col => col.name === 'done');
-  const shownDone = doneCol ? (doneCol.tasks || []).length : 0;
-  const totalDone = (_kanbanBoard && Number.isFinite(Number(_kanbanBoard.done_total)))
-    ? Number(_kanbanBoard.done_total) : null;
-  const globalCapNote = (totalDone !== null && totalDone > shownDone)
-    ? `<div class="kanban-empty kanban-lane-cap-note">${esc(t('kanban_done_capped', shownDone, totalDone))}</div>`
-    : '';
-  return `<div class="kanban-profile-lanes">${globalCapNote}${lanes.map(lane => {
+  // Show it once, above the lanes, instead of hiding it entirely.
+  return `<div class="kanban-profile-lanes">${_kanbanCapNoteHtml()}${lanes.map(lane => {
     const laneCols = columns.map(col => ({...col, tasks: (col.tasks || []).filter(task => _kanbanLaneKey(task) === lane)}));
     const count = laneCols.reduce((sum, col) => sum + (col.tasks || []).length, 0);
     const laneClass = lane === KANBAN_UNASSIGNED_LANE ? ' kanban-profile-lane-unassigned' : '';
@@ -2593,7 +2604,11 @@ function _kanbanRenderBoard(){
   _kanbanRenderSidebar(columns);
   if (total === 0) {
     const unfilteredTotal = (_kanbanBoard.columns || []).reduce((n, col) => n + (col.tasks || []).length, 0);
-    board.innerHTML = unfilteredTotal > 0 ? _kanbanHiddenByFiltersHtml() : _kanbanEmptyBoardHtml();
+    // Zero hits is exactly when the operator needs to know that the search
+    // never covered the older done cards.
+    board.innerHTML = unfilteredTotal > 0
+      ? _kanbanHiddenByFiltersHtml() + _kanbanCapNoteHtml()
+      : _kanbanEmptyBoardHtml();
     return;
   }
   board.innerHTML = _kanbanLanesByProfile ? _kanbanRenderProfileLanes(columns) : columns.map(col => _kanbanRenderColumn(col)).join('');
