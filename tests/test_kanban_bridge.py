@@ -1546,3 +1546,45 @@ def test_board_payload_includes_unassigned_ready_tasks_without_assignee_filter(m
         "Unassigned task must have a falsy assignee in the payload so the "
         "frontend _kanbanLaneKey() maps it to KANBAN_UNASSIGNED_LANE."
     )
+
+
+def test_board_payload_ships_slim_cards_and_caps_done(monkeypatch):
+    """Board cards are a slim projection, not the full task dataclass.
+
+    The full 47-field dump (with complete body/result for every done card
+    ever) made the board payload 925 KiB while every active column was empty
+    (audit 2026-07-27). The card whitelist plus the done cap is the contract
+    the frontend renders from; full body/result stay on the per-task detail
+    endpoint.
+    """
+    bridge = _load_bridge(monkeypatch)
+    fake_kanban = sys.modules["hermes_cli.kanban_db"]
+    long_body = "B" * 5000
+    fake_kanban.tasks = [
+        FakeTask(f"t_done_{i}", f"Done {i}", "done", "worker", body=long_body)
+        for i in range(bridge._BOARD_DONE_LIMIT + 25)
+    ]
+    for i, task in enumerate(fake_kanban.tasks):
+        task.completed_at = 1_000_000 + i
+        task.result = "must not ship on cards"
+
+    data = bridge._board_payload(_parsed())
+    done_column = next(c for c in data["columns"] if c["name"] == "done")
+
+    # Cap: only the most recently completed cards ship; the total is exposed.
+    assert len(done_column["tasks"]) == bridge._BOARD_DONE_LIMIT
+    assert data["done_total"] == bridge._BOARD_DONE_LIMIT + 25
+    shipped_ids = {t["id"] for t in done_column["tasks"]}
+    assert f"t_done_{bridge._BOARD_DONE_LIMIT + 24}" in shipped_ids  # newest
+    assert "t_done_0" not in shipped_ids  # oldest fell off
+
+    card = done_column["tasks"][0]
+    # Whitelist: no full body, no result, no age duplicate.
+    assert "result" not in card
+    assert "age" not in card
+    assert card["body"].endswith("…")
+    assert len(card["body"]) <= bridge._BOARD_BODY_EXCERPT_CHARS + 1
+    # Everything the frontend renders from is present.
+    for key in ("id", "title", "assignee", "tenant", "priority", "status",
+                "age_seconds", "link_counts", "comment_count"):
+        assert key in card, key

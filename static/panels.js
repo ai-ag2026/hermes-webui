@@ -2,6 +2,7 @@ let _currentPanel = 'chat';
 let _renamingAppTitlebar = false;  // guard against re-entrant rename
 let _kanbanBoard = null;
 let _kanbanLatestEventId = 0;
+let _kanbanMetaCache = null;
 let _kanbanPollTimer = null;
 let _kanbanCurrentTaskId = null;
 let _kanbanLanesByProfile = true;
@@ -2703,13 +2704,26 @@ async function loadKanban(animate){
   const list = $('kanbanList');
   try {
     if (animate && board && !_kanbanBoard) board.innerHTML = `<div style="padding:16px;color:var(--muted);font-size:13px">${esc(t('loading'))}</div>`;
-    // Resolve the active board before board-scoped requests. If another CLI or
-    // tab archived the previous board, /boards can fall back to default instead
-    // of leaving config/board pinned to a ghost slug.
-    await loadKanbanBoards();
-    const config = await api('/api/kanban/config' + _kanbanBoardQuery());
-    let assignees = null;
-    try { assignees = await api('/api/kanban/assignees' + _kanbanBoardQuery()); } catch(e) { assignees = null; }
+    // Board list, config and assignees change on the minutes-to-never scale,
+    // but this function runs on every SSE-driven refresh (sub-second while a
+    // worker is active). Cache the three meta requests per board for 60 s so
+    // a refresh costs /board + /stats instead of five serial round-trips.
+    // The TTL keeps the ghost-slug fallback (boards archived by another
+    // tab/CLI) self-healing within a minute.
+    let config, assignees = null;
+    const metaKey = _kanbanCurrentBoard || '';
+    if (_kanbanMetaCache && _kanbanMetaCache.key === metaKey && (Date.now() - _kanbanMetaCache.at) < 60000) {
+      config = _kanbanMetaCache.config;
+      assignees = _kanbanMetaCache.assignees;
+    } else {
+      // Resolve the active board before board-scoped requests. If another CLI or
+      // tab archived the previous board, /boards can fall back to default instead
+      // of leaving config/board pinned to a ghost slug.
+      await loadKanbanBoards();
+      config = await api('/api/kanban/config' + _kanbanBoardQuery());
+      try { assignees = await api('/api/kanban/assignees' + _kanbanBoardQuery()); } catch(e) { assignees = null; }
+      _kanbanMetaCache = {key: _kanbanCurrentBoard || '', config, assignees, at: Date.now()};
+    }
     _kanbanApplyConfigDefaults(config);
     const filters = _kanbanCurrentFilters();
     const params = new URLSearchParams();
@@ -2759,7 +2773,17 @@ async function loadKanban(animate){
   }
 }
 
-function filterKanban(){ _kanbanRenderBoard(); }
+// Debounced: the search box calls this per keystroke, and _kanbanRenderBoard
+// rebuilds the full board + sidebar DOM (~thousands of nodes). Re-rendering
+// on every keypress made typing in the filter feel sluggish.
+let _kanbanFilterTimer = null;
+function filterKanban(){
+  if (_kanbanFilterTimer) clearTimeout(_kanbanFilterTimer);
+  _kanbanFilterTimer = setTimeout(() => {
+    _kanbanFilterTimer = null;
+    _kanbanRenderBoard();
+  }, 200);
+}
 
 async function loadKanbanStats(){
   try {
@@ -2804,10 +2828,20 @@ function _kanbanStopPolling(){
   if (_kanbanEventSource) { try { if(_kanbanEventSource.readyState!==2)_kanbanEventSource.close(); } catch(_) {} _kanbanEventSource = null; }
 }
 
+let _kanbanEventStreamKey = null;
 function _kanbanStartEventStream(){
+  // Reuse a healthy stream for the same board. Every SSE-driven refresh ends
+  // in loadKanban() → _kanbanStartPolling() → here; unconditionally tearing
+  // down and reopening churned one HTTP connection + server thread per
+  // refresh (the old thread only noticed on its next write, up to 15 s
+  // later). Only a board switch or a dead stream warrants a new connection —
+  // the `since` cursor changing does NOT: it only matters at connect time.
+  const streamKey = _kanbanCurrentBoard || '';
+  if (_kanbanEventSource && _kanbanEventSource.readyState !== 2 && _kanbanEventStreamKey === streamKey) return;
   // Tear down any prior stream before opening a new one (board switch,
   // login change, etc.).
   if (_kanbanEventSource) { try { if(_kanbanEventSource.readyState!==2)_kanbanEventSource.close(); } catch(_) {} _kanbanEventSource = null; }
+  _kanbanEventStreamKey = streamKey;
   const since = Number(_kanbanLatestEventId || 0);
   let url = '/api/kanban/events/stream' + _kanbanBoardQuery({since: since});
   let es;

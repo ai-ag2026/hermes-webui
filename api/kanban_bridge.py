@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 from api.sse_chunked import end_sse_headers
+import threading
 import time
 from dataclasses import asdict, is_dataclass
 from urllib.parse import parse_qs, unquote
@@ -83,6 +84,10 @@ def _normalise_board_or_raise(raw):
     return normed
 
 
+_INIT_DONE_BOARDS: set = set()
+_INIT_DONE_LOCK = threading.Lock()
+
+
 def _conn(board=None):
     """Initialize the kanban DB for the given board slug and return a context manager
     that yields a sqlite connection and CLOSES it on exit.
@@ -93,9 +98,26 @@ def _conn(board=None):
     that leaks one FD per request and pins stale WAL snapshots (FDs to deleted
     ``-wal``/``-shm`` files), which starves SQLite checkpoints on the shared
     kanban DB and aggravates probe⇄checkpoint contention for every process.
+
+    ``init_db`` runs once per board slug per server process, not per request.
+    It deliberately evicts kanban_db's ``_INITIALIZED_PATHS`` cache so
+    ``connect`` re-runs the cold path — cross-process flock, header
+    validation, a full-file ``PRAGMA integrity_check`` and the migration
+    sweep, ~28 ms against 0.5 ms warm. Paying that on every ``/api/kanban/*``
+    request (5 per board view) was the largest single server-side cost of the
+    kanban panel, and running the corruption probe hundreds of times a day
+    against a hot WAL DB produced spurious ``.corrupt.*.bak`` quarantines
+    (audit 2026-07-27). Schema drift while the server runs is handled the
+    same way every other kanban_db consumer handles it: the per-process
+    first-connect init inside ``connect`` itself.
     """
     kb = _kb()
-    kb.init_db(board=board)
+    slug = str(board or "default")
+    if slug not in _INIT_DONE_BOARDS:
+        with _INIT_DONE_LOCK:
+            if slug not in _INIT_DONE_BOARDS:
+                kb.init_db(board=board)
+                _INIT_DONE_BOARDS.add(slug)
     closing = getattr(kb, "connect_closing", None)
     if closing is not None:
         return closing(board=board)
@@ -126,8 +148,33 @@ def _task_dict(task):
     except Exception:
         age = None
     data["age_seconds"] = age
-    data["age"] = age
     data.setdefault("progress", None)
+    return data
+
+
+# Fields the board view actually renders (cards, sidebar list, search
+# haystack, drag/drop). Everything else — full body, result, workspace_path,
+# 20+ null columns — belongs to the per-task detail endpoint. Shipping the
+# whole 47-field dataclass for every card made the payload 925 KiB with all
+# active columns empty (audit 2026-07-27).
+_BOARD_TASK_FIELDS = (
+    "id", "title", "assignee", "tenant", "priority", "status",
+    "age_seconds", "progress",
+)
+_BOARD_BODY_EXCERPT_CHARS = 280
+# Finished work is history, not board state: cap the done column at the most
+# recently completed cards instead of shipping every done task ever.
+_BOARD_DONE_LIMIT = 50
+
+
+def _board_task_dict(task):
+    """Slim per-card projection of a task for the board payload."""
+    full = _task_dict(task)
+    data = {key: full.get(key) for key in _BOARD_TASK_FIELDS}
+    body = full.get("body") or ""
+    if len(body) > _BOARD_BODY_EXCERPT_CHARS:
+        body = body[:_BOARD_BODY_EXCERPT_CHARS] + "…"
+    data["body"] = body
     return data
 
 
@@ -449,12 +496,31 @@ def _board_payload(parsed):
             assignee=assignee,
             include_archived=include_archived,
         )
-        link_counts = _task_link_counts(conn, tasks)
+        by_status = {}
+        for task in tasks:
+            by_status.setdefault(task.status, []).append(task)
+        done_tasks = by_status.get("done", [])
+        done_total = len(done_tasks)
+        if done_total > _BOARD_DONE_LIMIT:
+            by_status["done"] = sorted(
+                done_tasks,
+                key=lambda t: (getattr(t, "completed_at", None)
+                               or getattr(t, "created_at", None) or 0),
+                reverse=True,
+            )[:_BOARD_DONE_LIMIT]
+        column_names = list(BOARD_COLUMNS) + (["archived"] if include_archived else [])
+        shown = [t for name in column_names for t in by_status.get(name, [])]
+
+        # Per-card annotations only for cards that are actually shipped —
+        # _blocker_details parses every task_events payload of the ids it is
+        # given, which for the full task list meant thousands of json.loads
+        # per request.
+        link_counts = _task_link_counts(conn, shown)
         comment_counts = _comment_counts(conn)
-        blocker_details = _blocker_details(conn, tasks)
+        blocker_details = _blocker_details(conn, shown)
 
         def row(task):
-            data = _task_dict(task)
+            data = _board_task_dict(task)
             data["link_counts"] = link_counts.get(task.id, {"parents": 0, "children": 0})
             data["comment_count"] = comment_counts.get(task.id, 0)
             detail = blocker_details.get(task.id)
@@ -466,16 +532,12 @@ def _board_payload(parsed):
             return data
 
         columns = [
-            {"name": name, "tasks": [row(task) for task in tasks if task.status == name]}
-            for name in BOARD_COLUMNS
+            {"name": name, "tasks": [row(task) for task in by_status.get(name, [])]}
+            for name in column_names
         ]
-        if include_archived:
-            columns.append({
-                "name": "archived",
-                "tasks": [row(task) for task in tasks if task.status == "archived"],
-            })
         return {
             "columns": columns,
+            "done_total": done_total,
             "tenants": sorted({task.tenant for task in tasks if getattr(task, "tenant", None)}),
             "assignees": sorted({task.assignee for task in tasks if getattr(task, "assignee", None)}),
             "latest_event_id": latest_event_id,
@@ -1951,7 +2013,7 @@ def handle_kanban_get(handler, parsed) -> bool | None:
         if path == "/api/kanban/boards":
             return j(handler, _list_boards_payload(parsed)) or True
         if path == "/api/kanban/board":
-            return j(handler, _board_payload(parsed)) or True
+            return j(handler, _board_payload(parsed), pretty=False) or True
         if path == "/api/kanban/config":
             return j(handler, _config_payload(board=_resolve_board(parsed))) or True
         if path == "/api/kanban/stats":
