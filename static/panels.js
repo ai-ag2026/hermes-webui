@@ -2509,17 +2509,23 @@ function _kanbanLaneNames(columns){
   return assigned;
 }
 
-function _kanbanRenderColumn(col){
+function _kanbanRenderColumn(col, opts){
   const tasks = col.tasks || [];
   // The server caps the done column and reports the true size as done_total.
   // Showing only tasks.length made the board claim a smaller history than it
   // has, and hid from the operator that search covers just the shipped slice.
-  const serverTotal = (col.name === 'done' && _kanbanBoard && Number.isFinite(Number(_kanbanBoard.done_total)))
+  //
+  // Only the CONSOLIDATED board may compare against done_total: inside a
+  // profile lane the shown cards are a filtered subset, so the global total
+  // is the wrong denominator ("3/268"). Lanes therefore pass suppressCap.
+  const suppressCap = !!(opts && opts.suppressCap);
+  const serverTotal = (!suppressCap && col.name === 'done' && _kanbanBoard
+      && Number.isFinite(Number(_kanbanBoard.done_total)))
     ? Number(_kanbanBoard.done_total) : null;
   const capped = serverTotal !== null && serverTotal > tasks.length;
   const countLabel = capped ? `${tasks.length}/${serverTotal}` : `${tasks.length}`;
   const capNote = capped
-    ? `<div class="kanban-empty">${esc(t('kanban_done_capped') || `Showing the ${tasks.length} most recent of ${serverTotal} — older cards are not loaded (and not searched).`)}</div>`
+    ? `<div class="kanban-empty">${esc(t('kanban_done_capped', tasks.length, serverTotal))}</div>`
     : '';
   return `<section class="kanban-column" data-status="${esc(col.name)}" data-kanban-status="${esc(col.name)}" ondragover="allowKanbanDrop(event)" ondragenter="event.currentTarget.classList.add('drop-target')" ondragleave="clearKanbanDrop(event)" ondrop="dropKanbanTask(event, '${esc(col.name)}')">
       <div class="kanban-column-head">
@@ -2535,12 +2541,12 @@ function _kanbanRenderColumn(col){
 
 function _kanbanRenderProfileLanes(columns){
   const lanes = _kanbanLaneNames(columns);
-  if (!lanes.length) return columns.map(_kanbanRenderColumn).join('');
+  if (!lanes.length) return columns.map(col => _kanbanRenderColumn(col)).join('');
   return `<div class="kanban-profile-lanes">${lanes.map(lane => {
     const laneCols = columns.map(col => ({...col, tasks: (col.tasks || []).filter(task => _kanbanLaneKey(task) === lane)}));
     const count = laneCols.reduce((sum, col) => sum + (col.tasks || []).length, 0);
     const laneClass = lane === KANBAN_UNASSIGNED_LANE ? ' kanban-profile-lane-unassigned' : '';
-    return `<section class="kanban-profile-lane${laneClass}" data-kanban-lane="${esc(lane)}"><header class="kanban-profile-lane-head"><span>${esc(_kanbanLaneLabel(lane))}</span><span class="kanban-count">${count}</span></header><div class="kanban-board kanban-board-in-lane">${laneCols.map(_kanbanRenderColumn).join('')}</div></section>`;
+    return `<section class="kanban-profile-lane${laneClass}" data-kanban-lane="${esc(lane)}"><header class="kanban-profile-lane-head"><span>${esc(_kanbanLaneLabel(lane))}</span><span class="kanban-count">${count}</span></header><div class="kanban-board kanban-board-in-lane">${laneCols.map(col => _kanbanRenderColumn(col, {suppressCap: true})).join('')}</div></section>`;
   }).join('')}</div>`;
 }
 
@@ -2578,7 +2584,7 @@ function _kanbanRenderBoard(){
     board.innerHTML = unfilteredTotal > 0 ? _kanbanHiddenByFiltersHtml() : _kanbanEmptyBoardHtml();
     return;
   }
-  board.innerHTML = _kanbanLanesByProfile ? _kanbanRenderProfileLanes(columns) : columns.map(_kanbanRenderColumn).join('');
+  board.innerHTML = _kanbanLanesByProfile ? _kanbanRenderProfileLanes(columns) : columns.map(col => _kanbanRenderColumn(col)).join('');
 }
 
 function _kanbanCard(task, status){

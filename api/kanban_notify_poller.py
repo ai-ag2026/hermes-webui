@@ -198,14 +198,20 @@ def _collect_board_claims(kb, slug: str) -> list[dict]:
             except Exception:
                 logger.debug("kanban notify: get_task failed for %s",
                              sub.get("task_id"), exc_info=True)
-            claims.append({
+            claim = {
                 "board": slug,
                 "sub": dict(sub),
                 "old_cursor": old_cursor,
                 "new_cursor": new_cursor,
                 "events": events,
                 "task": task,
-            })
+            }
+            claims.append(claim)
+            # Register IMMEDIATELY: the cursor moved in the CAS above, so from
+            # this instant the events live only here. Registering later (after
+            # the whole board loop) left a window in which a shutdown could
+            # not rewind them (TARS re-review 2026-07-27).
+            _INFLIGHT_CLAIMS.append((kb, [claim]))
     return claims
 
 
@@ -269,7 +275,7 @@ def _start_turn(session_id: str, message: str) -> dict:
     return start_session_turn(session_id, message, source="process_wakeup")
 
 
-def _dead_letter(kb, conn, claim: dict, reason: str) -> None:
+def _dead_letter(kb, conn, claim: dict, reason: str) -> bool:
     """Record an undeliverable notification on the task itself.
 
     Dropping a subscription (session deleted, repeated turn-start failures)
@@ -289,7 +295,7 @@ def _dead_letter(kb, conn, claim: dict, reason: str) -> None:
         append = getattr(kb, "_append_event", None)
         if append is not None:
             append(conn, sub["task_id"], "notify_delivery_failed", payload)
-            return
+            return True
     except Exception:
         pass
     try:
@@ -297,9 +303,11 @@ def _dead_letter(kb, conn, claim: dict, reason: str) -> None:
             conn, sub["task_id"], author="kanban-notify",
             body=f"Notification could not be delivered ({reason}): {payload}",
         )
+        return True
     except Exception:
         logger.warning("kanban notify: could not record dead-letter for %s",
                        sub.get("task_id"), exc_info=True)
+        return False
 
 
 def _finalize_claims(kb, claims: list[dict], *, delivered: bool) -> None:
@@ -390,7 +398,16 @@ def _drop_subscriptions(kb, claims: list[dict], *, reason: str) -> None:
                     except Exception:
                         logger.debug("kanban notify: rewind-before-drop failed for %s",
                                      sub.get("task_id"), exc_info=True)
-                    _dead_letter(kb, conn, c, reason)
+                    if not _dead_letter(kb, conn, c, reason):
+                        # No durable trace → keep the subscription. A retry
+                        # next tick is far better than an undelivered result
+                        # that leaves no evidence anywhere.
+                        logger.warning(
+                            "kanban notify: keeping subscription for %s — the "
+                            "dead-letter marker could not be written",
+                            sub.get("task_id"),
+                        )
+                        continue
                     try:
                         kb.remove_notify_sub(
                             conn,
@@ -424,8 +441,12 @@ def _rewind_inflight() -> int:
             _finalize_claims(kb, pending, delivered=False)
             rewound += len(pending)
         except Exception:
+            # Put them back: dropping them here would silently consume the
+            # events the rewind was supposed to save.
+            _INFLIGHT_CLAIMS.append((kb, claims))
             logger.warning("kanban notify: could not rewind in-flight claims",
                            exc_info=True)
+            break
     return rewound
 
 
@@ -446,11 +467,8 @@ def run_tick() -> int:
             logger.warning("kanban notify: board %s tick failed", slug, exc_info=True)
     if not claims:
         return 0
-    # The claim already advanced the durable cursor, so from here until each
-    # claim is finalized the events exist only in memory. Publish them so a
-    # graceful shutdown can rewind instead of swallowing them (TARS review,
-    # P1) — the common case is exactly a WebUI restart mid-tick.
-    _INFLIGHT_CLAIMS.append((kb, claims))
+    # Claims were already published to _INFLIGHT_CLAIMS inside
+    # _collect_board_claims, right after each cursor CAS.
 
     by_session: dict[str, list[dict]] = {}
     for c in claims:
@@ -524,12 +542,16 @@ def run_tick() -> int:
                     "(status=%s, attempt %d/%d)",
                     session_id, status, failures, _MAX_CONSECUTIVE_FAILURES,
                 )
+    # Every claim of this tick reached a terminal decision above; drop the
+    # per-claim registrations so the shutdown drain does not re-handle them.
     for c in claims:
         c["_finalized"] = True
-    try:
-        _INFLIGHT_CLAIMS.remove((kb, claims))
-    except ValueError:
-        pass
+    for entry in [e for e in _INFLIGHT_CLAIMS
+                  if all(c.get("_finalized") for c in e[1])]:
+        try:
+            _INFLIGHT_CLAIMS.remove(entry)
+        except ValueError:
+            pass
     return started
 
 
@@ -574,6 +596,19 @@ def stop_kanban_notify_poller(timeout: float = 2.0) -> None:
     th = _THREAD
     if th is not None and th.is_alive():
         th.join(timeout=timeout)
+    if th is not None and th.is_alive():
+        # The tick is STILL running (a turn start can block). Rewinding now
+        # would race the live tick: it could re-deliver events the running
+        # thread is about to hand over, and start_kanban_notify_poller()
+        # already refuses to start a second poller while this one lives.
+        # Leave the claims registered — the next stop or the tick itself
+        # resolves them (TARS re-review 2026-07-27).
+        logger.warning(
+            "kanban notify: poller thread still running after %.1fs; leaving "
+            "%d in-flight claim(s) registered instead of racing it",
+            timeout, len(_INFLIGHT_CLAIMS),
+        )
+        return
     # A tick interrupted by shutdown holds claims whose cursor already moved.
     # Rewind them so a restart redelivers instead of the events being lost.
     try:

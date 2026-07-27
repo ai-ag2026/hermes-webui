@@ -329,21 +329,101 @@ def test_dropping_subscription_rewinds_and_dead_letters(fake_env):
     assert marker.payload["reason"] == "session_not_found"
 
 
-def test_lost_rewind_race_is_dead_lettered(fake_env, monkeypatch):
-    """If another poller moved the cursor on, the loss becomes visible."""
+def test_lost_rewind_race_is_dead_lettered(fake_env):
+    """A REAL interleaving: a sibling poller claims past us mid-turn.
+
+    Sequence: we claim [0->4] and start the turn; while that turn is being
+    started a second poller claims [4->9]; our turn then fails with 409. Our
+    CAS rewind must refuse (the row no longer reads 4), and the loss must be
+    recorded instead of silently dropped.
+    """
     kb, turns, responses = fake_env
-    kb.subs.append(FakeSub("t_race", "sess1"))
+    sub = FakeSub("t_race", "sess1")
+    kb.subs.append(sub)
     kb.tasks["t_race"] = FakeTask("t_race", "Race")
     kb.events.append(FakeEvent(4, "t_race", "completed"))
     responses.append({"_status": 409, "error": "session already has an active stream"})
 
-    real_rewind = kb.rewind_notify_cursor
-    def losing_rewind(*a, **kw):
-        real_rewind(*a, **kw)
-        return False  # CAS refused: a sibling poller advanced past our claim
-    monkeypatch.setattr(kb, "rewind_notify_cursor", losing_rewind)
+    def sibling_poller_claims_during_turn(session_id, message):
+        # Runs at exactly the moment our turn start is in flight.
+        kb.events.append(FakeEvent(9, "t_race", "completed"))
+        old, new_cursor, evs = kb.claim_unseen_events_for_sub(
+            None, task_id="t_race", platform="webui", chat_id="sess1",
+        )
+        assert (old, new_cursor) == (4, 9), (old, new_cursor)
+        turns.append((session_id, message))
+        return responses.pop(0)
 
-    poller.run_tick()
+    import api.kanban_notify_poller as p
+    p._start_turn = sibling_poller_claims_during_turn
+    try:
+        poller.run_tick()
+    finally:
+        pass
+
+    # The sibling's cursor (9) must survive — our rewind must NOT clobber it.
+    assert sub.last_event_id == 9
+    assert "t_race" not in kb.rewinds
     assert any(e.kind == "notify_delivery_failed"
                and e.payload["reason"] == "rewind_lost_race"
                for e in kb.appended_events)
+
+
+def test_claim_is_registered_before_delivery(fake_env):
+    """The claim must be shutdown-recoverable the moment the cursor moves."""
+    kb, _turns, _ = fake_env
+    kb.subs.append(FakeSub("t_reg", "sess1"))
+    kb.tasks["t_reg"] = FakeTask("t_reg", "Register")
+    kb.events.append(FakeEvent(5, "t_reg", "completed"))
+
+    poller._INFLIGHT_CLAIMS.clear()
+    claims = poller._collect_board_claims(kb, "default")
+    assert claims
+    # Registered by _collect_board_claims itself, not only later in run_tick.
+    registered = [c for _kb, batch in poller._INFLIGHT_CLAIMS for c in batch]
+    assert [c["sub"]["task_id"] for c in registered] == ["t_reg"]
+    poller._INFLIGHT_CLAIMS.clear()
+
+
+def test_subscription_survives_failed_dead_letter(fake_env, monkeypatch):
+    """No durable marker → keep the subscription rather than lose the result."""
+    kb, _turns, responses = fake_env
+    kb.subs.append(FakeSub("t_nomark", "gone"))
+    kb.tasks["t_nomark"] = FakeTask("t_nomark", "Ohne Marker")
+    kb.events.append(FakeEvent(6, "t_nomark", "completed"))
+    responses.append({"_status": 404, "error": "Session not found"})
+
+    def failing_append(*a, **kw):
+        raise RuntimeError("event store unavailable")
+    monkeypatch.setattr(kb, "_append_event", failing_append)
+    # add_comment fallback must fail too, so no marker can be written.
+    monkeypatch.setattr(kb, "add_comment", failing_append, raising=False)
+
+    poller.run_tick()
+    assert kb.removed == [], "subscription must survive a failed dead-letter"
+
+
+def test_stop_does_not_rewind_while_thread_runs(fake_env, monkeypatch):
+    """Rewinding under a live tick would race it; leave the claims alone."""
+    kb, _turns, _ = fake_env
+    sub = FakeSub("t_live", "sess1")
+    kb.subs.append(sub)
+    kb.tasks["t_live"] = FakeTask("t_live", "Live")
+    kb.events.append(FakeEvent(8, "t_live", "completed"))
+
+    poller._INFLIGHT_CLAIMS.clear()
+    claims = poller._collect_board_claims(kb, "default")
+    assert claims and sub.last_event_id == 8
+
+    class _AliveThread:
+        def is_alive(self):
+            return True
+        def join(self, timeout=None):
+            return None
+
+    monkeypatch.setattr(poller, "_THREAD", _AliveThread())
+    poller.stop_kanban_notify_poller(timeout=0)
+
+    assert sub.last_event_id == 8, "must not rewind under a running tick"
+    assert poller._INFLIGHT_CLAIMS, "claims stay registered for later"
+    poller._INFLIGHT_CLAIMS.clear()
