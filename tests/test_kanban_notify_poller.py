@@ -434,3 +434,103 @@ def test_stop_does_not_rewind_while_thread_runs(fake_env, monkeypatch):
     assert sub.last_event_id == 8, "must not rewind under a running tick"
     assert poller._INFLIGHT_CLAIMS, "claims stay registered for later"
     poller._INFLIGHT_CLAIMS.clear()
+
+
+# ---------------------------------------------------------------------------
+# Repair round 5 (2026-07-28): _finalize_claims must be able to REPORT failure
+# ---------------------------------------------------------------------------
+
+def _break_board_conn(monkeypatch):
+    """Make the board transaction blow up the way a locked/corrupt DB would."""
+    import api.kanban_bridge as bridge
+
+    def exploding_conn(board=None):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(bridge, "_conn", exploding_conn)
+
+
+def test_finalize_reports_board_failure_and_leaves_claims_open(fake_env, monkeypatch):
+    """A failed board must not count as settled.
+
+    The old ``-> None`` signature swallowed the board error, so run_tick's
+    blanket ``_finalized = True`` declared the claim done anyway — and the
+    shutdown drain then skipped exactly the claim that still needed a rewind.
+    """
+    kb, _turns, _ = fake_env
+    sub = FakeSub("t_fail", "sess1")
+    kb.subs.append(sub)
+    kb.tasks["t_fail"] = FakeTask("t_fail", "Fehlerhaft")
+    kb.events.append(FakeEvent(12, "t_fail", "completed"))
+
+    poller._INFLIGHT_CLAIMS.clear()
+    claims = poller._collect_board_claims(kb, "default")
+    assert claims and sub.last_event_id == 12
+
+    _break_board_conn(monkeypatch)
+    assert poller._finalize_claims(kb, claims, delivered=True) is False
+    assert not any(c.get("_finalized") for c in claims), (
+        "a board that never opened cannot have finalized its claims"
+    )
+    poller._INFLIGHT_CLAIMS.clear()
+
+
+def test_finalize_reports_success_and_marks_claims(fake_env):
+    """The positive control: a board that goes through marks its claims."""
+    kb, _turns, _ = fake_env
+    kb.subs.append(FakeSub("t_ok", "sess1"))
+    kb.tasks["t_ok"] = FakeTask("t_ok", "Sauber")
+    kb.events.append(FakeEvent(13, "t_ok", "completed"))
+
+    poller._INFLIGHT_CLAIMS.clear()
+    claims = poller._collect_board_claims(kb, "default")
+    assert poller._finalize_claims(kb, claims, delivered=True) is True
+    assert all(c.get("_finalized") for c in claims)
+    poller._INFLIGHT_CLAIMS.clear()
+
+
+def test_rewind_keeps_claims_registered_when_finalize_fails(fake_env, monkeypatch):
+    """The repair branch in _rewind_inflight was unreachable before."""
+    kb, _turns, _ = fake_env
+    sub = FakeSub("t_keep", "sess1")
+    kb.subs.append(sub)
+    kb.tasks["t_keep"] = FakeTask("t_keep", "Bleibt")
+    kb.events.append(FakeEvent(14, "t_keep", "completed"))
+
+    poller._INFLIGHT_CLAIMS.clear()
+    poller._collect_board_claims(kb, "default")
+    assert len(poller._INFLIGHT_CLAIMS) == 1
+
+    _break_board_conn(monkeypatch)
+    assert poller._rewind_inflight() == 0, "nothing was actually rewound"
+    assert poller._INFLIGHT_CLAIMS, (
+        "an unrewindable claim must stay registered instead of being dropped"
+    )
+    assert sub.last_event_id == 14, "cursor untouched — the rewind never ran"
+    poller._INFLIGHT_CLAIMS.clear()
+
+
+def test_tick_leaves_failed_claims_registered_for_the_drain(fake_env, monkeypatch):
+    """End-to-end: finalize fails during the tick → shutdown still sees it."""
+    kb, _turns, _ = fake_env
+    sub = FakeSub("t_e2e", "sess1")
+    kb.subs.append(sub)
+    kb.tasks["t_e2e"] = FakeTask("t_e2e", "Ende zu Ende")
+    kb.events.append(FakeEvent(15, "t_e2e", "completed"))
+
+    poller._INFLIGHT_CLAIMS.clear()
+    real_finalize = poller._finalize_claims
+
+    def finalize_failing_once(kb_, claims_, *, delivered):
+        return False  # board blew up inside
+
+    monkeypatch.setattr(poller, "_finalize_claims", finalize_failing_once)
+    poller.run_tick()
+    monkeypatch.setattr(poller, "_finalize_claims", real_finalize)
+
+    assert poller._INFLIGHT_CLAIMS, (
+        "the tick must not prune a claim whose finalize reported failure"
+    )
+    registered = [c for _kb, batch in poller._INFLIGHT_CLAIMS for c in batch]
+    assert [c["sub"]["task_id"] for c in registered] == ["t_e2e"]
+    poller._INFLIGHT_CLAIMS.clear()

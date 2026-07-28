@@ -310,13 +310,22 @@ def _dead_letter(kb, conn, claim: dict, reason: str) -> bool:
         return False
 
 
-def _finalize_claims(kb, claims: list[dict], *, delivered: bool) -> None:
-    """Rewind cursors on failure; drop subscriptions of finished tasks on success."""
+def _finalize_claims(kb, claims: list[dict], *, delivered: bool) -> bool:
+    """Rewind cursors on failure; drop subscriptions of finished tasks on success.
+
+    Returns True only when EVERY board was finalized. A board whose connection
+    or transaction blew up leaves its claims un-finalized on purpose: they keep
+    their ``_INFLIGHT_CLAIMS`` registration so the shutdown drain still sees
+    them. Swallowing that failure silently (the old ``-> None``) made the
+    repair branch in :func:`_rewind_inflight` unreachable and let the claims
+    count as settled anyway (TARS review 2026-07-27).
+    """
     by_board: dict[str, list[dict]] = {}
     for c in claims:
         by_board.setdefault(c["board"], []).append(c)
     from api.kanban_bridge import _conn
 
+    all_ok = True
     for board, board_claims in by_board.items():
         try:
             with _conn(board) as conn:
@@ -363,23 +372,33 @@ def _finalize_claims(kb, claims: list[dict], *, delivered: bool) -> None:
                             logger.debug("kanban notify: unsubscribe failed for %s",
                                          sub.get("task_id"), exc_info=True)
         except Exception:
+            all_ok = False
             logger.warning("kanban notify: finalize failed for board %s",
                            board, exc_info=True)
+        else:
+            # Only a board that got through counts as settled.
+            for c in board_claims:
+                c["_finalized"] = True
+    return all_ok
 
 
-def _drop_subscriptions(kb, claims: list[dict], *, reason: str) -> None:
+def _drop_subscriptions(kb, claims: list[dict], *, reason: str) -> bool:
     """Deactivate subscriptions whose destination can never be served.
 
     Always rewinds the claim first: giving up on the CHANNEL must not also
     consume the task's terminal events, and the loss is recorded on the task
     so an operator (and `hermes kanban audit`) can see that a finished task's
     result was never announced.
+
+    Returns True only when every board got through — same contract as
+    :func:`_finalize_claims`, so a failed board keeps its inflight claims.
     """
     by_board: dict[str, list[dict]] = {}
     for c in claims:
         by_board.setdefault(c["board"], []).append(c)
     from api.kanban_bridge import _conn
 
+    all_ok = True
     for board, board_claims in by_board.items():
         try:
             with _conn(board) as conn:
@@ -420,8 +439,14 @@ def _drop_subscriptions(kb, claims: list[dict], *, reason: str) -> None:
                         logger.debug("kanban notify: drop sub failed for %s",
                                      sub.get("task_id"), exc_info=True)
         except Exception:
+            all_ok = False
             logger.warning("kanban notify: drop subs failed for board %s",
                            board, exc_info=True)
+        else:
+            # Rewound and dead-lettered: nothing left for the drain to redo.
+            for c in board_claims:
+                c["_finalized"] = True
+    return all_ok
 
 
 # Claims whose cursor is already advanced but whose delivery has not been
@@ -438,15 +463,24 @@ def _rewind_inflight() -> int:
         if not pending:
             continue
         try:
-            _finalize_claims(kb, pending, delivered=False)
-            rewound += len(pending)
+            finalized = _finalize_claims(kb, pending, delivered=False)
         except Exception:
-            # Put them back: dropping them here would silently consume the
-            # events the rewind was supposed to save.
-            _INFLIGHT_CLAIMS.append((kb, claims))
+            finalized = False
             logger.warning("kanban notify: could not rewind in-flight claims",
                            exc_info=True)
+        if not finalized:
+            # Put them back: dropping them here would silently consume the
+            # events the rewind was supposed to save. Reachable only since
+            # _finalize_claims reports board failures instead of swallowing
+            # them (TARS review 2026-07-27).
+            _INFLIGHT_CLAIMS.append((kb, claims))
+            logger.warning(
+                "kanban notify: in-flight claims for %d subscription(s) could "
+                "not be rewound — keeping them registered for the next drain",
+                len(pending),
+            )
             break
+        rewound += len(pending)
     return rewound
 
 
@@ -542,10 +576,11 @@ def run_tick() -> int:
                     "(status=%s, attempt %d/%d)",
                     session_id, status, failures, _MAX_CONSECUTIVE_FAILURES,
                 )
-    # Every claim of this tick reached a terminal decision above; drop the
-    # per-claim registrations so the shutdown drain does not re-handle them.
-    for c in claims:
-        c["_finalized"] = True
+    # NOT marked here in bulk any more: _finalize_claims/_drop_subscriptions
+    # mark exactly the claims whose board transaction got through. A blanket
+    # mark declared claims settled that a failed board had never touched, so
+    # the shutdown drain skipped precisely the ones that still needed a rewind
+    # (TARS review 2026-07-27).
     for entry in [e for e in _INFLIGHT_CLAIMS
                   if all(c.get("_finalized") for c in e[1])]:
         try:
