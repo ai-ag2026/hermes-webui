@@ -48,6 +48,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 
 logger = logging.getLogger("hermes_webui.kanban_notify")
 
@@ -177,8 +178,39 @@ def _collect_board_claims(kb, slug: str) -> list[dict]:
                 continue
             if not pending:
                 continue
+            # B0 (2026-07-28): take a LEASE instead of claiming the cursor.
+            # The cursor stays where it is until a turn has actually started —
+            # so a process that dies mid-delivery leaves the events still
+            # pending, not stranded past a cursor nobody can rewind any more.
+            if not hasattr(kb, "acquire_notify_sub_lease"):
+                logger.warning(
+                    "kanban notify: board %s runs an agent build without the "
+                    "subscription lease — skipping to avoid the pre-B0 loss "
+                    "path", slug,
+                )
+                return claims
             try:
-                old_cursor, new_cursor, events = kb.claim_unseen_events_for_sub(
+                lease = kb.acquire_notify_sub_lease(
+                    conn,
+                    task_id=sub["task_id"],
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or None,
+                    owner=_OWNER,
+                )
+            except Exception:
+                logger.warning("kanban notify: lease failed for %s",
+                               sub.get("task_id"), exc_info=True)
+                continue
+            if lease is None:
+                # Someone else is delivering this one, or it is parked in a
+                # durable backoff window. Both mean: not ours this tick.
+                continue
+
+            # Re-read under our own lease: the pre-filter above was
+            # unsynchronised, and the events are what we are about to promise.
+            try:
+                new_cursor, events = kb.unseen_events_for_sub(
                     conn,
                     task_id=sub["task_id"],
                     platform=sub["platform"],
@@ -187,32 +219,51 @@ def _collect_board_claims(kb, slug: str) -> list[dict]:
                     kinds=CLAIM_KINDS,
                 )
             except Exception:
-                logger.warning("kanban notify: claim failed for %s",
+                logger.warning("kanban notify: re-read failed for %s",
                                sub.get("task_id"), exc_info=True)
-                continue
+                events = []
+                new_cursor = lease["last_event_id"]
             if not events:
+                _release_lease(kb, conn, slug, sub, lease, retry_after=0)
                 continue
+
             task = None
             try:
                 task = kb.get_task(conn, sub["task_id"])
             except Exception:
                 logger.debug("kanban notify: get_task failed for %s",
                              sub.get("task_id"), exc_info=True)
-            claim = {
+            claims.append({
                 "board": slug,
                 "sub": dict(sub),
-                "old_cursor": old_cursor,
+                "old_cursor": lease["last_event_id"],
                 "new_cursor": new_cursor,
                 "events": events,
                 "task": task,
-            }
-            claims.append(claim)
-            # Register IMMEDIATELY: the cursor moved in the CAS above, so from
-            # this instant the events live only here. Registering later (after
-            # the whole board loop) left a window in which a shutdown could
-            # not rewind them (TARS re-review 2026-07-27).
-            _INFLIGHT_CLAIMS.append((kb, [claim]))
+                "lease": lease,
+            })
     return claims
+
+
+def _release_lease(kb, conn, board, sub, lease, *, retry_after: int) -> None:
+    """Hand the lease back without moving the cursor. Never raises."""
+    try:
+        kb.release_notify_sub_lease(
+            conn,
+            task_id=sub["task_id"],
+            platform=sub["platform"],
+            chat_id=sub["chat_id"],
+            thread_id=sub.get("thread_id") or None,
+            owner=_OWNER,
+            generation=lease["generation"],
+            lease_version=lease["lease_version"],
+            retry_after_seconds=retry_after,
+        )
+    except Exception:
+        # A lost release is survivable BY DESIGN: the lease expires on its own
+        # and the cursor never moved, so the events stay deliverable.
+        logger.debug("kanban notify: lease release failed for %s on %s",
+                     sub.get("task_id"), board, exc_info=True)
 
 
 def _event_line(claim: dict, ev) -> str | None:
@@ -308,6 +359,117 @@ def _dead_letter(kb, conn, claim: dict, reason: str) -> bool:
         logger.warning("kanban notify: could not record dead-letter for %s",
                        sub.get("task_id"), exc_info=True)
         return False
+
+
+def _commit_delivery(kb, claims: list[dict]) -> bool:
+    """Advance the cursor for delivered claims — fenced on our own lease.
+
+    This is the ONLY place the cursor moves, and it moves only after a turn
+    has actually started. If the fence rejects us (our lease expired and
+    someone else took over, or the subscription was unsubscribed and
+    re-subscribed in between), the cursor stays put: the new owner will
+    deliver the same events again. At-least-once, never at-most-once.
+    """
+    by_board: dict[str, list[dict]] = {}
+    for c in claims:
+        by_board.setdefault(c["board"], []).append(c)
+    from api.kanban_bridge import _conn
+
+    all_ok = True
+    for board, board_claims in by_board.items():
+        try:
+            with _conn(board) as conn:
+                for c in board_claims:
+                    sub, lease = c["sub"], c["lease"]
+                    committed = kb.commit_notify_sub_delivery(
+                        conn,
+                        task_id=sub["task_id"],
+                        platform=sub["platform"],
+                        chat_id=sub["chat_id"],
+                        thread_id=sub.get("thread_id") or None,
+                        owner=_OWNER,
+                        generation=lease["generation"],
+                        lease_version=lease["lease_version"],
+                        new_cursor=c["new_cursor"],
+                    )
+                    if not committed:
+                        # Not a data loss: the events remain unconsumed.
+                        logger.warning(
+                            "kanban notify: lease fence rejected the commit for "
+                            "%s — the turn ran, the cursor stays; expect one "
+                            "redelivery", sub.get("task_id"),
+                        )
+                        continue
+                    task = c["task"]
+                    if task is not None and getattr(task, "status", None) in ("done", "archived"):
+                        try:
+                            kb.remove_notify_sub(
+                                conn,
+                                task_id=sub["task_id"],
+                                platform=sub["platform"],
+                                chat_id=sub["chat_id"],
+                                thread_id=sub.get("thread_id") or None,
+                            )
+                        except Exception:
+                            logger.debug("kanban notify: unsubscribe failed for %s",
+                                         sub.get("task_id"), exc_info=True)
+        except Exception:
+            all_ok = False
+            logger.warning("kanban notify: commit failed for board %s",
+                           board, exc_info=True)
+    return all_ok
+
+
+def _park_claims(kb, claims: list[dict], *, retry_after: int) -> None:
+    """Delivery did not happen: give the leases back, cursor untouched."""
+    by_board: dict[str, list[dict]] = {}
+    for c in claims:
+        by_board.setdefault(c["board"], []).append(c)
+    from api.kanban_bridge import _conn
+
+    for board, board_claims in by_board.items():
+        try:
+            with _conn(board) as conn:
+                for c in board_claims:
+                    _release_lease(kb, conn, board, c["sub"], c["lease"],
+                                   retry_after=retry_after)
+        except Exception:
+            logger.debug("kanban notify: parking failed for board %s",
+                         board, exc_info=True)
+
+
+def _retire_claims(kb, claims: list[dict], *, reason: str) -> None:
+    """Terminal: deactivate the subscription AND record why, atomically."""
+    by_board: dict[str, list[dict]] = {}
+    for c in claims:
+        by_board.setdefault(c["board"], []).append(c)
+    from api.kanban_bridge import _conn
+
+    for board, board_claims in by_board.items():
+        try:
+            with _conn(board) as conn:
+                for c in board_claims:
+                    sub, lease = c["sub"], c["lease"]
+                    retired = kb.retire_notify_sub_with_marker(
+                        conn,
+                        task_id=sub["task_id"],
+                        platform=sub["platform"],
+                        chat_id=sub["chat_id"],
+                        thread_id=sub.get("thread_id") or None,
+                        owner=_OWNER,
+                        generation=lease["generation"],
+                        lease_version=lease["lease_version"],
+                        reason=reason,
+                        payload={"events": len(c.get("events") or [])},
+                    )
+                    if not retired:
+                        logger.warning(
+                            "kanban notify: could not retire %s (%s) — lease "
+                            "fence rejected it", sub.get("task_id"), reason,
+                        )
+        except Exception:
+            logger.warning("kanban notify: retire failed for board %s",
+                           board, exc_info=True)
 
 
 def _finalize_claims(kb, claims: list[dict], *, delivered: bool) -> bool:
@@ -449,13 +611,23 @@ def _drop_subscriptions(kb, claims: list[dict], *, reason: str) -> bool:
     return all_ok
 
 
-# Claims whose cursor is already advanced but whose delivery has not been
-# finalized yet. Emptied at the end of every tick; drained on shutdown.
+# Identity of THIS poller process for the subscription lease. A restart gets a
+# new one on purpose: the old owner's leases must expire rather than be
+# silently re-adopted by a process that has lost all in-memory state.
+_OWNER = f"webui-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+# PRE-B0 leftovers. The lease keeps the cursor still until delivery is
+# confirmed, so there is nothing in flight to rewind any more. Kept inert for
+# one release so a rollback is a one-line change (design note B5).
 _INFLIGHT_CLAIMS: "list[tuple]" = []
 
 
 def _rewind_inflight() -> int:
-    """Rewind claims that were taken but never finalized. Returns count."""
+    """PRE-B0 rescue path. Inert since the lease keeps the cursor still.
+
+    Kept for one release so a rollback to the claim-then-deliver protocol is a
+    one-line change. _INFLIGHT_CLAIMS is no longer filled, so this returns 0.
+    """
     rewound = 0
     while _INFLIGHT_CLAIMS:
         kb, claims = _INFLIGHT_CLAIMS.pop()
@@ -519,7 +691,7 @@ def run_tick() -> int:
         if not lines:
             # Only silent kinds (status/archived/unblocked): consume without
             # waking anyone, and still drop subs of finished tasks.
-            _finalize_claims(kb, session_claims, delivered=True)
+            _commit_delivery(kb, session_claims)
             continue
 
         try:
@@ -533,32 +705,32 @@ def run_tick() -> int:
         if status == 200:
             _FAILURES.pop(session_id, None)
             _BACKOFF_UNTIL.pop(session_id, None)
-            _finalize_claims(kb, session_claims, delivered=True)
+            _commit_delivery(kb, session_claims)
             started += 1
             logger.info("kanban notify: woke session %s with %d event(s)",
                         session_id, len(lines))
         elif status == 404:
             # Session is gone; the subscription can never deliver. Drop it so
             # the notifier stops claiming for a dead destination.
-            _drop_subscriptions(kb, session_claims, reason="session_not_found")
+            _retire_claims(kb, session_claims, reason="session_not_found")
             logger.info("kanban notify: session %s not found; dropped %d subscription(s)",
                         session_id, len(session_claims))
         elif status == 409 and resp.get("error") == "process_wakeup_paused":
             _BACKOFF_UNTIL[session_id] = time.monotonic() + _PAUSED_BACKOFF_SECONDS
-            _finalize_claims(kb, session_claims, delivered=False)
+            _park_claims(kb, session_claims, retry_after=int(_PAUSED_BACKOFF_SECONDS))
             logger.info("kanban notify: session %s wakeups paused; backing off %.0fs",
                         session_id, _PAUSED_BACKOFF_SECONDS)
         elif status == 409:
             # An active turn raced us. The durable cursor is our redelivery
             # queue: rewind and retry after a short backoff.
             _BACKOFF_UNTIL[session_id] = time.monotonic() + _RETRY_BACKOFF_SECONDS
-            _finalize_claims(kb, session_claims, delivered=False)
+            _park_claims(kb, session_claims, retry_after=int(_RETRY_BACKOFF_SECONDS))
             logger.debug("kanban notify: session %s busy; will retry", session_id)
         else:
             failures = _FAILURES.get(session_id, 0) + 1
             _FAILURES[session_id] = failures
             if failures >= _MAX_CONSECUTIVE_FAILURES:
-                _drop_subscriptions(
+                _retire_claims(
                     kb, session_claims, reason=f"turn_start_failed_status_{status}",
                 )
                 _FAILURES.pop(session_id, None)
@@ -570,17 +742,16 @@ def run_tick() -> int:
                 )
             else:
                 _BACKOFF_UNTIL[session_id] = time.monotonic() + _FAILURE_BACKOFF_SECONDS
-                _finalize_claims(kb, session_claims, delivered=False)
+                _park_claims(kb, session_claims, retry_after=int(_FAILURE_BACKOFF_SECONDS))
                 logger.warning(
                     "kanban notify: turn start failed for session %s "
                     "(status=%s, attempt %d/%d)",
                     session_id, status, failures, _MAX_CONSECUTIVE_FAILURES,
                 )
-    # NOT marked here in bulk any more: _finalize_claims/_drop_subscriptions
-    # mark exactly the claims whose board transaction got through. A blanket
-    # mark declared claims settled that a failed board had never touched, so
-    # the shutdown drain skipped precisely the ones that still needed a rewind
-    # (TARS review 2026-07-27).
+    # Since B0 every claim is settled through the lease: committed, parked or
+    # retired. Nothing stays "in flight" in memory, so there is nothing to
+    # mark and nothing for a shutdown drain to rescue — the cursor never moved
+    # ahead of a delivery in the first place.
     for entry in [e for e in _INFLIGHT_CLAIMS
                   if all(c.get("_finalized") for c in e[1])]:
         try:

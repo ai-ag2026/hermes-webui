@@ -51,6 +51,11 @@ class FakeSub:
     platform: str = "webui"
     thread_id: str = ""
     last_event_id: int = 0
+    active: bool = True
+    generation: int = 1
+    lease_owner: str | None = None
+    lease_until: int | None = None
+    lease_version: int = 0
 
     def as_row(self) -> dict:
         return {
@@ -73,6 +78,9 @@ class FakeKB:
     rewinds: list[str] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
     appended_events: list = field(default_factory=list)
+    commits: list = field(default_factory=list)
+    releases: list = field(default_factory=list)
+    clock: int = 1_000_000
 
     def _append_event(self, conn, task_id, kind, payload):
         self.appended_events.append(
@@ -120,6 +128,76 @@ class FakeKB:
             return old, old, []
         sub.last_event_id = new_cursor
         return old, new_cursor, evs
+
+    # --- Subscription lease (B0, 2026-07-28) -----------------------------
+    # Modelled faithfully, fences included: the tests must be able to fail on a
+    # missing fence, otherwise they prove nothing about the protocol.
+
+    def acquire_notify_sub_lease(self, conn, *, task_id, platform, chat_id,
+                                 thread_id=None, owner, lease_seconds=300,
+                                 now=None):
+        now = int(self.clock if now is None else now)
+        sub = self._sub(task_id, chat_id)
+        if sub is None or not sub.active:
+            return None
+        if sub.lease_until is not None and sub.lease_until > now:
+            return None          # a live lease belongs to someone else
+        sub.lease_owner = owner
+        sub.lease_until = now + lease_seconds
+        sub.lease_version += 1
+        return {
+            "generation": sub.generation,
+            "lease_version": sub.lease_version,
+            "last_event_id": sub.last_event_id,
+        }
+
+    def _fence_ok(self, sub, owner, generation, lease_version):
+        return (sub is not None
+                and sub.lease_owner == owner
+                and sub.lease_version == lease_version
+                and sub.generation == generation)
+
+    def commit_notify_sub_delivery(self, conn, *, task_id, platform, chat_id,
+                                   thread_id=None, owner, generation,
+                                   lease_version, new_cursor):
+        sub = self._sub(task_id, chat_id)
+        if not self._fence_ok(sub, owner, generation, lease_version):
+            return False
+        sub.last_event_id = new_cursor
+        sub.lease_owner = None
+        sub.lease_until = None
+        self.commits.append((task_id, new_cursor))
+        return True
+
+    def release_notify_sub_lease(self, conn, *, task_id, platform, chat_id,
+                                 thread_id=None, owner, generation,
+                                 lease_version, retry_after_seconds=0, now=None):
+        now = int(self.clock if now is None else now)
+        sub = self._sub(task_id, chat_id)
+        if not self._fence_ok(sub, owner, generation, lease_version):
+            return False
+        sub.lease_owner = None
+        sub.lease_until = now + retry_after_seconds if retry_after_seconds > 0 else None
+        self.releases.append((task_id, retry_after_seconds))
+        return True
+
+    def retire_notify_sub_with_marker(self, conn, *, task_id, platform, chat_id,
+                                      thread_id=None, owner, generation,
+                                      lease_version, reason, payload=None):
+        sub = self._sub(task_id, chat_id)
+        if not self._fence_ok(sub, owner, generation, lease_version):
+            return False
+        # Atomic like the real one: if the marker cannot be written, the
+        # subscription must NOT end up deactivated without a trace.
+        marker = dict(payload or {})
+        marker.setdefault("reason", reason)
+        self._append_event(conn, task_id, "notify_delivery_failed", marker)
+        sub.active = False
+        sub.lease_owner = None
+        sub.lease_until = None
+        self.subs.remove(sub)
+        self.removed.append(task_id)
+        return True
 
     def rewind_notify_cursor(self, conn, *, task_id, platform, chat_id,
                              thread_id=None, claimed_cursor, old_cursor):
@@ -210,192 +288,201 @@ def test_silent_kinds_consumed_without_waking(fake_env):
     assert not kb.removed                       # task not done → sub stays
 
 
-def test_busy_session_rewinds_and_retries_after_backoff(fake_env, monkeypatch):
+def test_busy_session_parks_without_moving_the_cursor(fake_env):
+    """409: the events stay unconsumed — there is nothing to rewind."""
     kb, turns, responses = fake_env
     sub = FakeSub("t_bsy", "sess1")
     kb.subs.append(sub)
-    kb.tasks["t_bsy"] = FakeTask("t_bsy", "Busy")
-    kb.events.append(FakeEvent(5, "t_bsy", "completed"))
+    kb.tasks["t_bsy"] = FakeTask("t_bsy", "Beschäftigt", status="running")
+    kb.events.append(FakeEvent(5, "t_bsy", "blocked"))
     responses.append({"_status": 409, "error": "session already has an active stream"})
 
     assert poller.run_tick() == 0
-    assert len(turns) == 1
-    assert kb.rewinds == ["t_bsy"]
-    assert sub.last_event_id == 0               # cursor restored: durable retry queue
-
-    # Within the backoff window the subscription is skipped entirely.
-    assert poller.run_tick() == 0
-    assert len(turns) == 1
-
-    # After the backoff expires the same event is redelivered.
-    poller._BACKOFF_UNTIL.clear()
-    assert poller.run_tick() == 1
-    assert len(turns) == 2
-    assert sub.last_event_id == 5
+    assert sub.last_event_id == 0, "the cursor never moved in the first place"
+    assert not kb.commits
+    assert kb.releases and kb.releases[-1][0] == "t_bsy"
+    assert kb.releases[-1][1] > 0, "parked with a durable backoff, not free"
+    assert sub.lease_owner is None
 
 
-def test_deleted_session_drops_subscription(fake_env):
-    kb, turns, responses = fake_env
+def test_deleted_session_retires_subscription_with_marker(fake_env):
+    """404: deactivation and its evidence land together."""
+    kb, _turns, responses = fake_env
     kb.subs.append(FakeSub("t_del", "gone"))
     kb.tasks["t_del"] = FakeTask("t_del", "Weg")
-    kb.events.append(FakeEvent(2, "t_del", "completed"))
+    kb.events.append(FakeEvent(3, "t_del", "completed"))
     responses.append({"_status": 404, "error": "Session not found"})
 
     assert poller.run_tick() == 0
     assert kb.removed == ["t_del"]
-    # New contract (TARS review 2026-07-27): giving up on the CHANNEL must not
-    # also consume the task's events — rewind first, then record the loss.
-    assert kb.rewinds == ["t_del"]
-    assert any(e.kind == "notify_delivery_failed" for e in kb.appended_events)
+    marker = next(e for e in kb.appended_events if e.kind == "notify_delivery_failed")
+    assert marker.payload["reason"] == "session_not_found"
+    assert not kb.commits, "an undelivered event must not consume the cursor"
 
 
-def test_paused_wakeups_back_off_long(fake_env):
-    kb, turns, responses = fake_env
-    sub = FakeSub("t_pau", "sess1")
+def test_paused_wakeups_park_long(fake_env):
+    kb, _turns, responses = fake_env
+    sub = FakeSub("t_pause", "sess1")
     kb.subs.append(sub)
-    kb.tasks["t_pau"] = FakeTask("t_pau", "Pause")
-    kb.events.append(FakeEvent(9, "t_pau", "completed"))
+    kb.tasks["t_pause"] = FakeTask("t_pause", "Pausiert")
+    kb.events.append(FakeEvent(2, "t_pause", "completed"))
     responses.append({"_status": 409, "error": "process_wakeup_paused"})
 
-    assert poller.run_tick() == 0
-    assert kb.rewinds == ["t_pau"]
+    poller.run_tick()
     assert sub.last_event_id == 0
-    backoff = poller._BACKOFF_UNTIL.get("sess1")
-    assert backoff is not None
-    import time
-    assert backoff - time.monotonic() > poller._RETRY_BACKOFF_SECONDS
+    assert kb.releases[-1][1] >= poller._PAUSED_BACKOFF_SECONDS
 
 
-def test_repeated_failures_cap_and_drop_subscription(fake_env):
+def test_repeated_failures_cap_and_retire(fake_env):
     kb, turns, responses = fake_env
     kb.subs.append(FakeSub("t_bad", "sess1"))
     kb.tasks["t_bad"] = FakeTask("t_bad", "Kaputt")
     kb.events.append(FakeEvent(4, "t_bad", "completed"))
 
-    for i in range(poller._MAX_CONSECUTIVE_FAILURES):
+    for _ in range(poller._MAX_CONSECUTIVE_FAILURES):
         responses.append({"_status": 500})
         poller._BACKOFF_UNTIL.clear()
+        # The backoff is DURABLE now: parking the lease is what holds the
+        # subscription back, so the in-memory map alone no longer unblocks a
+        # retry. Advancing the clock past the park window is the honest way to
+        # drive the cap — and it documents that the backoff survives a restart.
+        kb.clock += 10_000
         poller.run_tick()
 
     assert kb.removed == ["t_bad"]
     assert len(turns) == poller._MAX_CONSECUTIVE_FAILURES
+    assert any(e.kind == "notify_delivery_failed" for e in kb.appended_events)
 
 
 # ---------------------------------------------------------------------------
-# Repair round after the TARS review (2026-07-27)
+# B0 (2026-07-28): the lease IS the protocol. These replace the rewind tests —
+# the pre-B0 design advanced the cursor first and tried to undo it afterwards,
+# which a crash took with it.
 # ---------------------------------------------------------------------------
 
-def test_shutdown_rewinds_unfinalized_claims(fake_env, monkeypatch):
-    """A tick interrupted by shutdown must not swallow claimed events.
-
-    The claim advances the durable cursor before the turn starts; without a
-    drain, a WebUI restart mid-tick loses that batch silently.
-    """
-    kb, turns, _ = fake_env
-    sub = FakeSub("t_shut", "sess1")
-    kb.subs.append(sub)
-    kb.tasks["t_shut"] = FakeTask("t_shut", "Shutdown")
-    kb.events.append(FakeEvent(11, "t_shut", "completed"))
-
-    # Simulate an interrupted tick: claim, then stop before finalizing.
-    # _collect_board_claims registers each claim itself (right after the
-    # cursor CAS), so appending the batch again here would build a
-    # production-impossible double registration (TARS re-review 2026-07-27).
-    poller._INFLIGHT_CLAIMS.clear()
-    claims = poller._collect_board_claims(kb, "default")
-    assert claims and sub.last_event_id == 11
-    assert len(poller._INFLIGHT_CLAIMS) == 1, "claim registers exactly once"
-    monkeypatch.setattr(poller, "_THREAD", None)
-
-    poller.stop_kanban_notify_poller(timeout=0)
-
-    assert sub.last_event_id == 0, "shutdown must rewind the claimed cursor"
-    assert kb.rewinds == ["t_shut"], "rewound exactly once, not twice"
-    assert not poller._INFLIGHT_CLAIMS
-    assert not [e for e in kb.appended_events if e.kind == "notify_delivery_failed"], (
-        "a plain shutdown rewind must not dead-letter anything"
-    )
-
-
-def test_dropping_subscription_rewinds_and_dead_letters(fake_env):
-    """Giving up on a channel must not consume the task's events silently."""
-    kb, turns, responses = fake_env
-    sub = FakeSub("t_dead", "gone")
-    kb.subs.append(sub)
-    kb.tasks["t_dead"] = FakeTask("t_dead", "Weg")
-    kb.events.append(FakeEvent(3, "t_dead", "completed"))
-    responses.append({"_status": 404, "error": "Session not found"})
-
-    assert poller.run_tick() == 0
-    assert kb.removed == ["t_dead"]
-    # Cursor rewound (events not consumed) and the loss recorded on the task.
-    assert sub.last_event_id == 0 or ("t_dead" in kb.rewinds)
-    assert any(e.kind == "notify_delivery_failed" for e in kb.appended_events), \
-        "an undeliverable notification must leave a durable marker"
-    marker = next(e for e in kb.appended_events if e.kind == "notify_delivery_failed")
-    assert marker.payload["reason"] == "session_not_found"
-
-
-def test_lost_rewind_race_is_dead_lettered(fake_env):
-    """A REAL interleaving: a sibling poller claims past us mid-turn.
-
-    Sequence: we claim [0->4] and start the turn; while that turn is being
-    started a second poller claims [4->9]; our turn then fails with 409. Our
-    CAS rewind must refuse (the row no longer reads 4), and the loss must be
-    recorded instead of silently dropped.
-    """
-    kb, turns, responses = fake_env
-    sub = FakeSub("t_race", "sess1")
-    kb.subs.append(sub)
-    kb.tasks["t_race"] = FakeTask("t_race", "Race")
-    kb.events.append(FakeEvent(4, "t_race", "completed"))
-    responses.append({"_status": 409, "error": "session already has an active stream"})
-
-    def sibling_poller_claims_during_turn(session_id, message):
-        # Runs at exactly the moment our turn start is in flight.
-        kb.events.append(FakeEvent(9, "t_race", "completed"))
-        old, new_cursor, evs = kb.claim_unseen_events_for_sub(
-            None, task_id="t_race", platform="webui", chat_id="sess1",
-        )
-        assert (old, new_cursor) == (4, 9), (old, new_cursor)
-        turns.append((session_id, message))
-        return responses.pop(0)
-
-    import api.kanban_notify_poller as p
-    p._start_turn = sibling_poller_claims_during_turn
-    try:
-        poller.run_tick()
-    finally:
-        pass
-
-    # The sibling's cursor (9) must survive — our rewind must NOT clobber it.
-    assert sub.last_event_id == 9
-    assert "t_race" not in kb.rewinds
-    assert any(e.kind == "notify_delivery_failed"
-               and e.payload["reason"] == "rewind_lost_race"
-               for e in kb.appended_events)
-
-
-def test_claim_is_registered_before_delivery(fake_env):
-    """The claim must be shutdown-recoverable the moment the cursor moves."""
+def test_lease_is_taken_before_delivery_and_cursor_stays_put(fake_env):
+    """The decisive invariant: nothing is consumed before it is delivered."""
     kb, _turns, _ = fake_env
-    kb.subs.append(FakeSub("t_reg", "sess1"))
-    kb.tasks["t_reg"] = FakeTask("t_reg", "Register")
-    kb.events.append(FakeEvent(5, "t_reg", "completed"))
+    sub = FakeSub("t_lease", "sess1")
+    kb.subs.append(sub)
+    kb.tasks["t_lease"] = FakeTask("t_lease", "Lease")
+    kb.events.append(FakeEvent(7, "t_lease", "completed"))
 
-    poller._INFLIGHT_CLAIMS.clear()
     claims = poller._collect_board_claims(kb, "default")
-    assert claims
-    # Registered by _collect_board_claims itself, not only later in run_tick.
-    registered = [c for _kb, batch in poller._INFLIGHT_CLAIMS for c in batch]
-    assert [c["sub"]["task_id"] for c in registered] == ["t_reg"]
-    poller._INFLIGHT_CLAIMS.clear()
+    assert [c["sub"]["task_id"] for c in claims] == ["t_lease"]
+    assert sub.last_event_id == 0, "claiming must NOT move the cursor any more"
+    assert sub.lease_owner == poller._OWNER
+    assert sub.lease_until is not None
 
 
-def test_subscription_survives_failed_dead_letter(fake_env, monkeypatch):
-    """No durable marker → keep the subscription rather than lose the result."""
+def test_crash_between_lease_and_delivery_loses_nothing(fake_env):
+    """Simulates the case that made the 27.07. loss unrecoverable."""
+    kb, turns, _ = fake_env
+    sub = FakeSub("t_crash", "sess1")
+    kb.subs.append(sub)
+    kb.tasks["t_crash"] = FakeTask("t_crash", "Absturz")
+    kb.events.append(FakeEvent(9, "t_crash", "completed"))
+
+    # Tick 1: lease taken, process dies before delivering.
+    poller._collect_board_claims(kb, "default")
+    assert sub.last_event_id == 0
+
+    # The dead owner's lease expires; a fresh poller generation takes over.
+    kb.clock += 10_000
+    assert poller.run_tick() == 1, "the events are still there to deliver"
+    assert sub.last_event_id == 9, "and NOW the cursor moves"
+    assert len(turns) == 1
+
+
+def test_second_poller_cannot_take_a_live_lease(fake_env):
+    """Two WebUI processes: exactly one delivers."""
+    kb, _turns, _ = fake_env
+    kb.subs.append(FakeSub("t_two", "sess1"))
+    kb.tasks["t_two"] = FakeTask("t_two", "Zwei")
+    kb.events.append(FakeEvent(11, "t_two", "completed"))
+
+    first = poller._collect_board_claims(kb, "default")
+    second = poller._collect_board_claims(kb, "default")
+    assert len(first) == 1
+    assert second == [], "the live lease belongs to the first caller"
+
+
+def test_commit_is_fenced_against_a_stale_owner(fake_env):
+    """An expired owner must not consume events someone else now owns."""
+    kb, _turns, _ = fake_env
+    sub = FakeSub("t_fence", "sess1")
+    kb.subs.append(sub)
+    kb.tasks["t_fence"] = FakeTask("t_fence", "Zaun")
+    kb.events.append(FakeEvent(13, "t_fence", "completed"))
+
+    claims = poller._collect_board_claims(kb, "default")
+    stale = claims[0]["lease"]
+
+    # Lease expires, another process takes over (bumping lease_version).
+    kb.clock += 10_000
+    taken = kb.acquire_notify_sub_lease(
+        None, task_id="t_fence", platform="webui", chat_id="sess1", owner="other",
+    )
+    assert taken is not None
+
+    assert kb.commit_notify_sub_delivery(
+        None, task_id="t_fence", platform="webui", chat_id="sess1",
+        owner=poller._OWNER, generation=stale["generation"],
+        lease_version=stale["lease_version"], new_cursor=13,
+    ) is False
+    assert sub.last_event_id == 0, "the fence protected the new owner's work"
+
+
+def test_resubscribe_generation_blocks_an_old_lease(fake_env):
+    """ABA: unsubscribe + re-subscribe must not accept the old holder."""
+    kb, _turns, _ = fake_env
+    sub = FakeSub("t_aba", "sess1")
+    kb.subs.append(sub)
+    kb.tasks["t_aba"] = FakeTask("t_aba", "ABA")
+    kb.events.append(FakeEvent(15, "t_aba", "completed"))
+
+    claims = poller._collect_board_claims(kb, "default")
+    lease = claims[0]["lease"]
+
+    sub.generation += 1          # re-subscribed in between
+    assert kb.commit_notify_sub_delivery(
+        None, task_id="t_aba", platform="webui", chat_id="sess1",
+        owner=poller._OWNER, generation=lease["generation"],
+        lease_version=lease["lease_version"], new_cursor=15,
+    ) is False
+    assert sub.last_event_id == 0
+
+
+def test_empty_read_under_lease_releases_it_immediately(fake_env):
+    """No events after all: hand the lease back, do not park the subscription."""
+    kb, _turns, _ = fake_env
+    sub = FakeSub("t_empty", "sess1")
+    kb.subs.append(sub)
+    kb.tasks["t_empty"] = FakeTask("t_empty", "Leer")
+    # No events at all -> the pre-filter skips it; force the lease path by
+    # giving it an event the filter sees and removing it before the re-read.
+    kb.events.append(FakeEvent(17, "t_empty", "completed"))
+    real_unseen = kb.unseen_events_for_sub
+    calls = {"n": 0}
+
+    def vanishing(conn, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_unseen(conn, **kw)
+        return 0, []                      # gone by the time we hold the lease
+
+    kb.unseen_events_for_sub = vanishing
+    assert poller._collect_board_claims(kb, "default") == []
+    assert sub.lease_owner is None, "the lease must not be left dangling"
+    assert sub.lease_until is None, "and it is free again, not parked"
+    assert sub.last_event_id == 0
+
+
+def test_subscription_survives_a_failed_marker(fake_env, monkeypatch):
+    """Terminal state and its evidence are one transaction — or neither."""
     kb, _turns, responses = fake_env
-    kb.subs.append(FakeSub("t_nomark", "gone"))
+    sub = FakeSub("t_nomark", "gone")
+    kb.subs.append(sub)
     kb.tasks["t_nomark"] = FakeTask("t_nomark", "Ohne Marker")
     kb.events.append(FakeEvent(6, "t_nomark", "completed"))
     responses.append({"_status": 404, "error": "Session not found"})
@@ -403,134 +490,21 @@ def test_subscription_survives_failed_dead_letter(fake_env, monkeypatch):
     def failing_append(*a, **kw):
         raise RuntimeError("event store unavailable")
     monkeypatch.setattr(kb, "_append_event", failing_append)
-    # add_comment fallback must fail too, so no marker can be written.
-    monkeypatch.setattr(kb, "add_comment", failing_append, raising=False)
 
     poller.run_tick()
-    assert kb.removed == [], "subscription must survive a failed dead-letter"
+    assert kb.removed == [], "no marker -> no silent deactivation"
+    assert sub in kb.subs
+    assert sub.last_event_id == 0, "and the events remain deliverable"
 
 
-def test_stop_does_not_rewind_while_thread_runs(fake_env, monkeypatch):
-    """Rewinding under a live tick would race it; leave the claims alone."""
-    kb, _turns, _ = fake_env
-    sub = FakeSub("t_live", "sess1")
+def test_silent_kinds_consume_the_cursor_without_waking(fake_env):
+    kb, turns, _ = fake_env
+    sub = FakeSub("t_sil2", "sess1")
     kb.subs.append(sub)
-    kb.tasks["t_live"] = FakeTask("t_live", "Live")
-    kb.events.append(FakeEvent(8, "t_live", "completed"))
+    kb.tasks["t_sil2"] = FakeTask("t_sil2", "Leise", status="running")
+    kb.events.append(FakeEvent(3, "t_sil2", "status", payload={"status": "running"}))
 
-    poller._INFLIGHT_CLAIMS.clear()
-    claims = poller._collect_board_claims(kb, "default")
-    assert claims and sub.last_event_id == 8
-
-    class _AliveThread:
-        def is_alive(self):
-            return True
-        def join(self, timeout=None):
-            return None
-
-    monkeypatch.setattr(poller, "_THREAD", _AliveThread())
-    poller.stop_kanban_notify_poller(timeout=0)
-
-    assert sub.last_event_id == 8, "must not rewind under a running tick"
-    assert poller._INFLIGHT_CLAIMS, "claims stay registered for later"
-    poller._INFLIGHT_CLAIMS.clear()
-
-
-# ---------------------------------------------------------------------------
-# Repair round 5 (2026-07-28): _finalize_claims must be able to REPORT failure
-# ---------------------------------------------------------------------------
-
-def _break_board_conn(monkeypatch):
-    """Make the board transaction blow up the way a locked/corrupt DB would."""
-    import api.kanban_bridge as bridge
-
-    def exploding_conn(board=None):
-        raise RuntimeError("database is locked")
-
-    monkeypatch.setattr(bridge, "_conn", exploding_conn)
-
-
-def test_finalize_reports_board_failure_and_leaves_claims_open(fake_env, monkeypatch):
-    """A failed board must not count as settled.
-
-    The old ``-> None`` signature swallowed the board error, so run_tick's
-    blanket ``_finalized = True`` declared the claim done anyway — and the
-    shutdown drain then skipped exactly the claim that still needed a rewind.
-    """
-    kb, _turns, _ = fake_env
-    sub = FakeSub("t_fail", "sess1")
-    kb.subs.append(sub)
-    kb.tasks["t_fail"] = FakeTask("t_fail", "Fehlerhaft")
-    kb.events.append(FakeEvent(12, "t_fail", "completed"))
-
-    poller._INFLIGHT_CLAIMS.clear()
-    claims = poller._collect_board_claims(kb, "default")
-    assert claims and sub.last_event_id == 12
-
-    _break_board_conn(monkeypatch)
-    assert poller._finalize_claims(kb, claims, delivered=True) is False
-    assert not any(c.get("_finalized") for c in claims), (
-        "a board that never opened cannot have finalized its claims"
-    )
-    poller._INFLIGHT_CLAIMS.clear()
-
-
-def test_finalize_reports_success_and_marks_claims(fake_env):
-    """The positive control: a board that goes through marks its claims."""
-    kb, _turns, _ = fake_env
-    kb.subs.append(FakeSub("t_ok", "sess1"))
-    kb.tasks["t_ok"] = FakeTask("t_ok", "Sauber")
-    kb.events.append(FakeEvent(13, "t_ok", "completed"))
-
-    poller._INFLIGHT_CLAIMS.clear()
-    claims = poller._collect_board_claims(kb, "default")
-    assert poller._finalize_claims(kb, claims, delivered=True) is True
-    assert all(c.get("_finalized") for c in claims)
-    poller._INFLIGHT_CLAIMS.clear()
-
-
-def test_rewind_keeps_claims_registered_when_finalize_fails(fake_env, monkeypatch):
-    """The repair branch in _rewind_inflight was unreachable before."""
-    kb, _turns, _ = fake_env
-    sub = FakeSub("t_keep", "sess1")
-    kb.subs.append(sub)
-    kb.tasks["t_keep"] = FakeTask("t_keep", "Bleibt")
-    kb.events.append(FakeEvent(14, "t_keep", "completed"))
-
-    poller._INFLIGHT_CLAIMS.clear()
-    poller._collect_board_claims(kb, "default")
-    assert len(poller._INFLIGHT_CLAIMS) == 1
-
-    _break_board_conn(monkeypatch)
-    assert poller._rewind_inflight() == 0, "nothing was actually rewound"
-    assert poller._INFLIGHT_CLAIMS, (
-        "an unrewindable claim must stay registered instead of being dropped"
-    )
-    assert sub.last_event_id == 14, "cursor untouched — the rewind never ran"
-    poller._INFLIGHT_CLAIMS.clear()
-
-
-def test_tick_leaves_failed_claims_registered_for_the_drain(fake_env, monkeypatch):
-    """End-to-end: finalize fails during the tick → shutdown still sees it."""
-    kb, _turns, _ = fake_env
-    sub = FakeSub("t_e2e", "sess1")
-    kb.subs.append(sub)
-    kb.tasks["t_e2e"] = FakeTask("t_e2e", "Ende zu Ende")
-    kb.events.append(FakeEvent(15, "t_e2e", "completed"))
-
-    poller._INFLIGHT_CLAIMS.clear()
-    real_finalize = poller._finalize_claims
-
-    def finalize_failing_once(kb_, claims_, *, delivered):
-        return False  # board blew up inside
-
-    monkeypatch.setattr(poller, "_finalize_claims", finalize_failing_once)
-    poller.run_tick()
-    monkeypatch.setattr(poller, "_finalize_claims", real_finalize)
-
-    assert poller._INFLIGHT_CLAIMS, (
-        "the tick must not prune a claim whose finalize reported failure"
-    )
-    registered = [c for _kb, batch in poller._INFLIGHT_CLAIMS for c in batch]
-    assert [c["sub"]["task_id"] for c in registered] == ["t_e2e"]
-    poller._INFLIGHT_CLAIMS.clear()
+    assert poller.run_tick() == 0
+    assert not turns
+    assert sub.last_event_id == 3, "consumed deliberately, not lost"
+    assert sub.lease_owner is None
