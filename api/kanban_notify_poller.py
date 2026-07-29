@@ -10,29 +10,44 @@ results piled up in the kanban DB and the session that ordered the work was
 never told.
 
 This poller is the WebUI-side consumer. Per tick it scans every board DB for
-``platform='webui'`` subscriptions, claims unseen terminal events with the same
-CAS discipline the gateway uses (``claim_unseen_events_for_sub`` /
-``rewind_notify_cursor``), and delivers them by starting a server-side agent
-turn (``api.routes.start_session_turn``) — the same Option-Z path background
-process completions use. The turn both shows the notification in the session
-transcript and lets the agent act on the result (read artifacts, present the
-outcome), which a passive UI ping could not.
+``platform='webui'`` subscriptions, LEASES the ones that have unseen terminal
+events, and delivers them by starting a server-side agent turn
+(``api.routes.start_session_turn``) — the same Option-Z path background process
+completions use. The turn both shows the notification in the session transcript
+and lets the agent act on the result (read artifacts, present the outcome),
+which a passive UI ping could not.
 
-Delivery contract:
-  - The subscription cursor is the durable queue. Claim advances it; any
-    delivery failure rewinds it (CAS-guarded), so events survive process
-    restarts. A graceful stop rewinds claims that were taken but not yet
-    delivered (``_rewind_inflight``); only a hard kill between claim and
-    turn-start can still lose a batch. Giving up on a channel (session gone,
-    repeated turn-start failures) rewinds too and records a
-    ``notify_delivery_failed`` event on the task, so an undelivered result is
-    visible instead of silently consumed.
+Delivery contract (B0, 2026-07-28 — this REPLACED claim-then-rewind):
+  - The cursor moves ONLY after a turn has actually started. Taking work means
+    taking a lease on the subscription (``acquire_notify_sub_lease``), reading
+    the events WITHOUT touching the cursor, delivering, and only then
+    committing the cursor under a fence of owner + lease_version + generation
+    (``commit_notify_sub_delivery``).
+  - The old design advanced the cursor first and undid it from process memory
+    on failure. A hard kill in between took the undo with it and left the
+    cursor past events nobody had received. There is nothing to undo any more:
+    a dead owner's lease simply expires while the cursor still points at the
+    undelivered events.
+  - The trade is explicit: this is at-least-once, NOT exactly-once. A process
+    that dies between a confirmed turn start and the cursor commit causes ONE
+    redelivery — and that wakeup starts an autonomous turn which may repeat
+    side effects. Losing a result was judged worse.
+  - Backoff authority: ``lease_until`` in the database is durable and survives
+    a restart; the in-process ``_BACKOFF_UNTIL``/``_FAILURES`` maps are an
+    additional per-process throttle. The backoff is therefore restart-proof,
+    the five-failure cap is not.
+  - Giving up on a channel (session gone, repeated turn-start failures)
+    deactivates the subscription AND records a ``notify_delivery_failed`` event
+    on the task IN ONE TRANSACTION (``retire_notify_sub_with_marker``), so a
+    dropped channel can never end up without its evidence — or the evidence
+    without the drop.
   - One turn per session per tick: all deliverable events for a session are
     batched into a single wakeup prompt, so parallel claims cannot race each
     other into 409s.
-  - ``status`` / ``archived`` / ``unblocked`` events are claimed but dropped
-    silently: they must not wake the agent, but leaving them unclaimed would
-    park the cursor in front of a later ``completed`` forever.
+  - ``status`` / ``archived`` / ``unblocked`` events are consumed but dropped
+    silently: they must not wake the agent, but leaving them unconsumed would
+    park the cursor in front of a later ``completed`` forever. They are the one
+    case where the cursor advances without a turn.
   - ``source="process_wakeup"`` deliberately opts into the provider-credential
     circuit breaker in ``start_session_turn`` — a poller that can wake dozens
     of sessions must not hammer an exhausted credential pool.
