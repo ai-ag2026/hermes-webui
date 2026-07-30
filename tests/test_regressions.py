@@ -195,10 +195,20 @@ def test_server_py_sse_loop_breaks_on_cancel(cleanup_test_sessions):
     src = (REPO_ROOT / "server.py").read_text()
     routes_src = (REPO_ROOT / "api" / "routes.py").read_text() if (REPO_ROOT / "api" / "routes.py").exists() else ""
     combined = src + routes_src
-    m = re.search(r"if event in \([^)]+\):\s*break", combined)
-    assert m, "SSE break condition not found in server.py or api/routes.py"
-    assert "cancel" in m.group(), \
-        f"'cancel' missing from SSE break condition: {m.group()}"
+    # #6527: the break condition may be an inline tuple ("stream_end", ...) OR
+    # the named SSE_RELAY_CLOSE_EVENTS frozenset. Accept either shape and pin
+    # the BEHAVIOR (cancel closes the relay) against the resolved close set,
+    # not the source syntax.
+    m = re.search(
+        r"if event in (?:SSE_RELAY_CLOSE_EVENTS|\([^)]*cancel[^)]*\)):\s*break",
+        combined,
+    )
+    assert m, "SSE break/close condition not found in server.py or api/routes.py"
+    from api.run_journal import SSE_RELAY_CLOSE_EVENTS
+    assert "cancel" in SSE_RELAY_CLOSE_EVENTS, \
+        f"'cancel' missing from SSE relay close set: {SSE_RELAY_CLOSE_EVENTS}"
+    assert "apperror" in SSE_RELAY_CLOSE_EVENTS, \
+        f"'apperror' missing from SSE relay close set: {SSE_RELAY_CLOSE_EVENTS}"
 
 
 # ── R6: Test cron isolation (Sprint 10) ──────────────────────────────────────
@@ -359,7 +369,10 @@ def test_server_delete_removes_session_bak_snapshot(cleanup_test_sessions):
         routes_src.find('if parsed.path == "/api/session/delete":'),
     )
     assert delete_idx >= 0, "session/delete handler not found in api/routes.py"
-    delete_block = routes_src[delete_idx:delete_idx+2400]
+    # 4000 statt 2400: upstreams Delete-Umbau (#6307, Lock mit Timeout) hat den
+    # Unlink auf Abstand 2707 geschoben. Verhalten unverändert, nur das Fenster
+    # war zu eng.
+    delete_block = routes_src[delete_idx:delete_idx+4000]
     assert "with_suffix('.json.bak').unlink" in delete_block or 'with_suffix(".json.bak").unlink' in delete_block, \
         "session/delete must unlink <sid>.json.bak to avoid later orphan-backup recovery"
 

@@ -78,5 +78,12 @@ node_modules/
 package-lock.json
 docs/ui-ux/review-shots/
 
+# Python build metadata (never commit generated egg-info)
+*.egg-info/
+
+# Local WebUI runtime data and credentials
+.webui_password
+attachments/
+
 # local git worktrees (not for commit)
 .worktrees/

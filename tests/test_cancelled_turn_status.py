@@ -180,7 +180,12 @@ class TestCancelledTurnPersistenceGuards:
     def test_post_run_cancel_guard_runs_before_normal_success_merge(self):
         src = _read("api/streaming.py")
         run_idx = src.find("result = agent.run_conversation(")
-        merge_idx = src.find("_result_messages = result.get", run_idx)
+        # Upstream-Merge 30.07.: der Merge-Punkt heißt jetzt
+        # ``_settle_result_messages`` — die frühere Ankerzeile
+        # ``_result_messages = result.get(...)`` gibt es im Normalpfad nicht
+        # mehr. Der Vertrag, den dieser Test schützt, ist unverändert: der
+        # Cancel-Guard muss VOR dem Merge laufen.
+        merge_idx = src.find("_result_messages = _settle_result_messages(", run_idx)
         assert run_idx != -1 and merge_idx != -1, "run/merge path not found"
         block = src[run_idx:merge_idx]
 
