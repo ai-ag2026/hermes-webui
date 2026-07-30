@@ -21,6 +21,8 @@
 
 ### Fixed
 
+- **The live Worklog no longer flashes a blank frame before the final answer settles.** On normal turn completion the live tool/thinking rows were cleared *before* the canonical settled transcript rendered, so on a costly rebuild readers could see a blank or intermediate frame between the live Worklog and the final answer. The live DOM under the assistant turn is now preserved until the settled renderer replaces it (a new `clearLiveToolCards({preserveDom:true})` path used only by the normal `done` settlement — cancel, error, and replace paths still clear unconditionally), and the scroll-snapshot is captured from the intact live DOM so a reader scrolled up mid-Worklog keeps their position through settlement. The one-shot forced-open/collapse protection is unchanged. Thanks @franksong2702. (#6473, #6472)
+
 - **Auto-generated session titles no longer stick as a trivial echo like "pong" or "Done".** Title generation now distinguishes a *freshly generated* candidate from an *already-stored* title: a new candidate that is just a one-word echo reply (`pong`, `ping`, `yes`, `done`, `cool`, `thanks`, …) or a completion filler (`ok`, `all set`, `finished`, …) is rejected so the title falls back to a meaningful local summary instead. At the same time, those same short words remain *valid* as an existing stored title, so a session that legitimately settled on a short title no longer re-fires the title LLM on every subsequent turn. Substantive agentic first-turn plans are still eligible as title sources. Thanks @cabluvsmkm2009-source. (#6529)
 
 - **Live SSE relays no longer hang after an application error.** The relay drain loops for `/api/chat/stream` and the run-event stream only closed on the hardcoded set `("stream_end", "error", "cancel")`, but the live chat path emits `apperror` as a terminal event with **no** trailing `stream_end` (it returns immediately after `put('apperror', …)`), and a bare `error` event is never emitted on that path — so a turn that ended in an application error left the client's EventSource loop draining forever. The three relay loops (`_stream_runner_run_events`, `_handle_sse_stream`, `emit_session_snapshot`) now share a single `api.run_journal.SSE_RELAY_CLOSE_EVENTS` close set (`stream_end`, `cancel`, `apperror`, and the still-real runner-adapter `error`); `done` is intentionally excluded because `title` and `stream_end` legitimately follow it. The post-cancel event-drop guard is corrected to keep delivering `apperror` (not the phantom `error`). Thanks @cabluvsmkm2009-source. (#6527)
@@ -382,6 +384,12 @@
 - **Test suite reads static assets as UTF-8 so it runs on Windows.** 34 test files that opened `static/` assets without an explicit encoding now pass `encoding="utf-8"`, so the suite no longer fails under a non-UTF-8 default locale (Windows `cp1252`). Two method signatures over-matched by the encoding sweep were reverted. Assertions are unchanged. Thanks @mo7al876any. (#5537)
 
 - **Added regression coverage for messaging clear-watermark semantics.** New test locks the watermark behavior so a future change can't silently regress it. Thanks @rodboev. (#5589, #5572)
+
+## [exp-v0.52.157] — 2026-07-29 — Experimental release (reconnect transcript ordering)
+
+### Fixed
+
+- **On SSE reconnect / mobile background-resume, the in-flight user prompt now stays above the live assistant worklog instead of jumping below it.** Both recovery paths (`loadSession` reattach and `refreshSession` soft-recovery, the iOS PWA background→resume path) now route the synthesized pending user message through one shared, identity-aware merge helper that inserts it immediately before the live assistant turn it started (and repairs the row in place if a prior render pushed it below). The helper is idempotent — a repeated recovery won't duplicate the prompt — and preserves legitimate repeated user turns. Thanks @nankingjing. (#6419, #6457)
 
 ## [exp-v0.52.156] — 2026-07-29 — Experimental release (hard-refresh session restore)
 
