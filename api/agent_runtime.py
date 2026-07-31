@@ -9,18 +9,105 @@ mixed runtime and require a clean WebUI restart instead.
 from __future__ import annotations
 
 from pathlib import Path
+import logging
+import os
+import signal
 import sys
 import subprocess
 import threading
+import time
 
 # Retain the discovered path as a diagnostic/test-visible compatibility value;
 # runtime identity is deliberately captured from the loaded module below.
 from api.config import _AGENT_DIR  # noqa: F401
 
+logger = logging.getLogger(__name__)
+
 _RESTART_MESSAGE = (
     "Hermes Agent was updated while Hermes WebUI was running. "
     "Restart Hermes WebUI before retrying this action."
 )
+_AUTO_RESTART_NOTE = (
+    " Hermes WebUI will restart itself as soon as no session is streaming — "
+    "retry afterwards."
+)
+
+# ── Stale-runtime auto-restart ──────────────────────────────────────────────
+# Once the guard trips, every action stays blocked until a process restart —
+# the process knows this, so it schedules one itself instead of waiting for a
+# human. The restart only fires when the WebUI is fully idle (no active
+# streams/worker runs, no manual compression job), so in-flight turns are
+# never interrupted; the service manager (systemd Restart=always) brings the
+# process back on the fresh checkout. Disable with
+# HERMES_WEBUI_STALE_AGENT_AUTO_RESTART=0 for setups whose supervisor does
+# not restart on exit.
+_AUTO_RESTART_ENV = "HERMES_WEBUI_STALE_AGENT_AUTO_RESTART"
+_AUTO_RESTART_POLL_SECONDS = 15.0
+_auto_restart_armed = threading.Event()
+
+
+def _stale_auto_restart_enabled() -> bool:
+    return os.getenv(_AUTO_RESTART_ENV, "1").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
+def _webui_is_idle() -> bool:
+    """True when a restart interrupts nothing: no live runs, no manual jobs.
+
+    Imports are deferred: models/routes import this module at startup, so
+    top-level back-imports would be circular. Fail closed — an unreadable
+    signal counts as busy, never as idle.
+    """
+    try:
+        from api.models import _active_stream_ids  # noqa: PLC0415
+
+        if _active_stream_ids():
+            return False
+    except Exception:
+        return False
+    try:
+        from api import routes  # noqa: PLC0415
+
+        with routes._MANUAL_COMPRESSION_JOBS_LOCK:
+            for job in routes._MANUAL_COMPRESSION_JOBS.values():
+                if job.get("status") == "running":
+                    return False
+    except Exception:
+        return False
+    return True
+
+
+def _auto_restart_when_idle() -> None:
+    logger.warning(
+        "Agent checkout changed under the running WebUI — restarting "
+        "automatically once idle (checked every %.0fs; opt out via %s=0).",
+        _AUTO_RESTART_POLL_SECONDS,
+        _AUTO_RESTART_ENV,
+    )
+    while True:
+        time.sleep(_AUTO_RESTART_POLL_SECONDS)
+        if _webui_is_idle():
+            logger.warning(
+                "WebUI idle and Agent runtime stale — exiting for a clean "
+                "restart by the service manager."
+            )
+            os.kill(os.getpid(), signal.SIGTERM)
+            return
+
+
+def _arm_stale_runtime_auto_restart() -> None:
+    """Schedule a one-shot idle restart; safe to call on every guard trip."""
+    if not _stale_auto_restart_enabled():
+        return
+    if _auto_restart_armed.is_set():
+        return
+    _auto_restart_armed.set()
+    threading.Thread(
+        target=_auto_restart_when_idle,
+        name="stale-agent-auto-restart",
+        daemon=True,
+    ).start()
 
 
 def _read_agent_revision(
@@ -136,7 +223,11 @@ def ensure_agent_runtime_current() -> None:
         _read_agent_revision(_AGENT_SOURCE_DIR, module_path=_AGENT_MODULE_PATH)
         != _AGENT_REVISION
     ):
-        raise AgentRuntimeChangedError(_RESTART_MESSAGE)
+        _arm_stale_runtime_auto_restart()
+        message = _RESTART_MESSAGE
+        if _auto_restart_armed.is_set():
+            message += _AUTO_RESTART_NOTE
+        raise AgentRuntimeChangedError(message)
 
 
 def require_ai_agent_class():
