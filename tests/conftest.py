@@ -35,6 +35,13 @@ if not (3, 11) <= sys.version_info[:2] <= (3, 13):
         returncode=3,
     )
 
+# Der Stale-Agent-Self-Restart (api/agent_runtime.py, default-on) hält die im
+# pytest-Prozess geladene Agent-Revision für veraltet, armiert seinen Timer und
+# SIGTERMt nach der Poll-Periode den GANZEN Testlauf ("Beendet" bei ~5 %).
+# Produktionsverhalten bleibt unberührt; die Feature-Tests setzen die Variable
+# per monkeypatch.setenv selbst. Muss VOR jedem agent_runtime-Import stehen.
+os.environ["HERMES_WEBUI_STALE_AGENT_AUTO_RESTART"] = "0"
+
 WINDOWS = sys.platform == "win32"
 requires_fcntl = pytest.mark.skipif(
     WINDOWS,
