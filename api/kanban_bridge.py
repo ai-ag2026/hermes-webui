@@ -765,7 +765,17 @@ def _patch_task(conn, task_id: str, body: dict):
             conn, task_id, result=body.get("result"), summary=body.get("summary"),
             **({"token": gate_token} if gate_token else {}),
         ):
-            raise LookupError("task not found")
+            # complete_task collapses every refusal into False. The task
+            # demonstrably exists (loaded above), so 404 "task not found" was a
+            # lie that sent operators refreshing a board that never changes
+            # (Vorfall 2026-08-01: gated Karte "nicht lösbar"). Name the causes
+            # an operator can actually act on; 409 via RuntimeError.
+            raise RuntimeError(
+                "complete refused by the Core — the card exists, but its "
+                "completion was rejected (pending review / acceptance_required "
+                "without accept / source status not completable / gate). "
+                "Check the card's events for the recorded reason."
+            )
     elif status == "blocked":
         if not kb.block_task(conn, task_id, reason=body.get("block_reason") or body.get("reason")):
             raise LookupError("task not found")
