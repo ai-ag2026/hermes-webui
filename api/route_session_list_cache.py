@@ -369,10 +369,27 @@ def _session_list_cache_source_stamp(key: tuple) -> tuple[object, ...]:
             session_index_path = _session_list_cache_session_dir() / "_index.json"
         except Exception:
             session_index_path = None
+        # Desktop-Reconciliation (test_webui_state_db_reconciliation): die
+        # offizielle Desktop-App settelt Folgezeilen einer WebUI-Session in
+        # state.db — der webui-Sidebar-Stempel muss das sehen, sonst zeigt die
+        # Liste dauerhaft den alten Stand. Bewusst nur der billige stat-Stempel
+        # (kein SQLite-Connect wie der Content-Fingerprint), und während eines
+        # aktiven Streams friert der #4672-Marker die Komponente weiter ein —
+        # per-Token-Writes busten den Cache also weiterhin NICHT.
+        state_component = _session_list_cache_streaming_freeze_marker()
+        if state_component is None:
+            try:
+                _sdb = Path(_session_list_cache_state_db_path())
+                state_component = (
+                    _session_list_cache_path_stamp(_sdb),
+                    _session_list_cache_path_stamp(_sdb.with_name(f"{_sdb.name}-wal")),
+                )
+            except Exception:
+                state_component = None
         return (
             marker,
             marker,
-            marker,
+            state_component,
             _session_list_cache_path_stamp(session_index_path),
             _session_list_cache_path_stamp(_session_list_cache_settings_file()),
             marker,

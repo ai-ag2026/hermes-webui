@@ -30,8 +30,11 @@ def test_autolink_regex_in_rendermd():
     # Locate the renderMd function body
     rendermd_start = content.find('function renderMd(raw){')
     assert rendermd_start != -1, "renderMd function not found in ui.js"
-    # Find the closing brace after renderMd (look for the autolink pattern within it)
-    rendermd_body = content[rendermd_start:rendermd_start + 15000]
+    # Window: bis zur nächsten Top-Level-Funktion statt willkürlicher 15000
+    # Zeichen — renderMd ist über die Jahre gewachsen (Stash-Pässe), und das
+    # feste Fenster endete VOR dem Autolink-Pass (false-red seit ~07/2026).
+    next_fn = content.find('\nfunction ', rendermd_start + 1)
+    rendermd_body = content[rendermd_start:next_fn if next_fn != -1 else len(content)]
     assert 'https?:\\/\\/' in rendermd_body, (
         "Autolink regex (https?:\\/\\/) not found inside renderMd() body."
     )

@@ -1,4 +1,5 @@
 """Hermes Web UI server entry point."""
+import importlib
 import logging
 import os
 import re
@@ -648,26 +649,19 @@ def main() -> None:
     except Exception as e:
         print(f'[!!] WARNING: Gateway watcher failed to start: {e}', flush=True)
 
-    try:
-        from api.background_process import start_drain_thread
-        if start_drain_thread():
-            print('[ok] bg_task_complete drain thread started', flush=True)
-    except Exception as e:
-        print(f'[!!] WARNING: bg_task_complete drain failed to start: {e}', flush=True)
-
-    try:
-        from api.kanban_notify_poller import start_kanban_notify_poller
-        if start_kanban_notify_poller():
-            print('[ok] kanban notify poller started', flush=True)
-    except Exception as e:
-        print(f'[!!] WARNING: kanban notify poller failed to start: {e}', flush=True)
-
-    try:
-        from api.background_process import start_session_channel_reaper
-        if start_session_channel_reaper():
-            print('[ok] SessionChannel reaper thread started', flush=True)
-    except Exception as e:
-        print(f'[!!] WARNING: SessionChannel reaper failed to start: {e}', flush=True)
+    # Optionale Hintergrunddienste: gleiche Start-Disziplin (best-effort,
+    # Fehlschlag warnt statt zu crashen), daher tabellengetrieben —
+    # server.py bleibt unter dem sprint10-Zeilenbudget.
+    for _mod, _fn, _label in (
+        ('api.background_process', 'start_drain_thread', 'bg_task_complete drain thread'),
+        ('api.kanban_notify_poller', 'start_kanban_notify_poller', 'kanban notify poller'),
+        ('api.background_process', 'start_session_channel_reaper', 'SessionChannel reaper thread'),
+    ):
+        try:
+            if getattr(importlib.import_module(_mod), _fn)():
+                print(f'[ok] {_label} started', flush=True)
+        except Exception as e:
+            print(f'[!!] WARNING: {_label} failed to start: {e}', flush=True)
 
     try:
         from api.plugins import load_plugins
@@ -742,20 +736,14 @@ def main() -> None:
             drain_all_on_shutdown()
         except Exception:
             logger.debug("Failed to drain lifecycle on shutdown", exc_info=True)
-        try:
-            from api.background_process import stop_drain_thread
-            stop_drain_thread()
-        except Exception:
-            logger.debug("Failed to stop bg_task_complete drain thread during shutdown", exc_info=True)
-        try:
-            from api.kanban_notify_poller import stop_kanban_notify_poller
-            stop_kanban_notify_poller()
-        except Exception:
-            logger.debug("Failed to stop kanban notify poller during shutdown", exc_info=True)
-        try:
-            from api.background_process import stop_session_channel_reaper
-            stop_session_channel_reaper()
-        except Exception:
-            logger.debug("Failed to stop SessionChannel reaper during shutdown", exc_info=True)
+        for _mod, _fn, _label in (
+            ('api.background_process', 'stop_drain_thread', 'bg_task_complete drain thread'),
+            ('api.kanban_notify_poller', 'stop_kanban_notify_poller', 'kanban notify poller'),
+            ('api.background_process', 'stop_session_channel_reaper', 'SessionChannel reaper'),
+        ):
+            try:
+                getattr(importlib.import_module(_mod), _fn)()
+            except Exception:
+                logger.debug("Failed to stop %s during shutdown", _label, exc_info=True)
 if __name__ == '__main__':
     main()

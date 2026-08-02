@@ -7295,11 +7295,15 @@ function renderMd(raw){
   // the file exists and is allowed — a 403/404 leaves the path as plain text,
   // so hallucinated or referenced-only paths never produce broken embeds.
   // Runs after the fence/inline-code stashes (code samples stay literal) and
-  // before the link passes; the lookbehind excludes URL/link/attr contexts.
+  // before the link passes; the leading group excludes URL/link/attr contexts.
+  // KEIN Lookbehind: ein Regex-Literal mit negativem Lookbehind wird beim
+  // PARSEN von ui.js ausgewertet und brickt Engines ohne Support (Safari
+  // <16.4, WebViews) — test_no_lookbehind_in_static_ui_js. Stattdessen wird
+  // das Vorzeichen explizit konsumiert und im Replacement wieder ausgegeben.
   const bare_probe_stash=[];
-  s=s.replace(/(?<![/:\w.`("'=\[\]])(~\/|\/)((?:[\w.\-]+\/)*[\w.\-]+\.(?:png|jpe?g|gif|webp|avif|svg|mp3|wav|m4a|ogg|flac|mp4|mov|webm|mkv|pdf|html?|csv|xlsx?|docx?|pptx?|zip|txt|md|json|diff|patch))\b(?![\w./-])/gi,(m0,lead,rest)=>{
+  s=s.replace(/(^|[^/:\w.`("'=\[\]])(~\/|\/)((?:[\w.\-]+\/)*[\w.\-]+\.(?:png|jpe?g|gif|webp|avif|svg|mp3|wav|m4a|ogg|flac|mp4|mov|webm|mkv|pdf|html?|csv|xlsx?|docx?|pptx?|zip|txt|md|json|diff|patch))\b(?![\w./-])/gi,(m0,pre,lead,rest)=>{
     bare_probe_stash.push(lead+rest);
-    return '\x00J'+(bare_probe_stash.length-1)+'\x00';
+    return pre+'\x00J'+(bare_probe_stash.length-1)+'\x00';
   });
   // Math stash: protect $$..$$ and $..$ from markdown processing
   // Runs AFTER fence_stash so backtick code spans protect their dollar-sign contents

@@ -41,10 +41,18 @@ def _free_port() -> int:
 
 class _HealthHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
+        # Content-Length ist Pflicht: ohne Länge endet die HTTP/1.0-Antwort
+        # erst am Verbindungsende, und der TLS-Teardown dieses Stubs sendet
+        # kein close_notify — curl mit OpenSSL >= 3.5 wertet das als
+        # "unexpected eof" und der Probe-Test scheiterte, obwohl das
+        # health_probe.sh-Skript korrekt ist. Die echte WebUI sendet die
+        # Länge immer.
+        body = b'{"status": "ok"}'
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(b'{"status": "ok"}')
+        self.wfile.write(body)
 
     def log_message(self, *args):  # suppress server log noise during tests
         pass
